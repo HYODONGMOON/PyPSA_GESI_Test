@@ -1,0 +1,91 @@
+# PyPSA_KOREA_GESI .gitignore
+
+# 결과 파일들 (용량이 크고 자동 생성됨)
+results/
+analysis_results/
+simple_results/
+
+# 백업 및 임시 파일들
+backup/
+temp/
+docs/
+
+# Python 관련
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 가상환경
+pypsa_env/
+venv/
+ENV/
+env/
+.venv
+
+# IDE 관련
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Excel 임시 파일들
+~$*.xlsx
+~$*.xls
+*.tmp
+
+# 로그 파일들
+*.log
+*.out
+
+# 운영체제 관련
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# CPLEX 관련
+*.lp
+*.mps
+*.sol
+
+# 대용량 데이터 파일들 (선택적)
+*.nc
+*.h5
+*.hdf5
+
+# 압축 파일들
+*.zip
+*.rar
+*.7z
+
+# 설정 파일들 (민감한 정보 포함 가능)
+config.ini
+secrets.json
+
+# Git 관련
+.git/ 
