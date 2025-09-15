@@ -488,12 +488,23 @@ def create_network(input_data):
                        co2_emissions=specs['co2_emissions'])
         
         # 시간 설정
-        if 'timeseries' in input_data:
+        if 'timeseries' in input_data and not input_data['timeseries'].empty:
             ts = input_data['timeseries'].iloc[0]
             snapshots = pd.date_range(
                 start=ts['start_time'],
                 end=ts['end_time'],
                 freq=ts['frequency'],
+                inclusive='left'
+            )
+            network.set_snapshots(snapshots)
+            snapshots_length = len(snapshots)
+        else:
+            # 기본 시간 설정 (2024년 1년간, 1시간 간격)
+            print("⚠️ timeseries 시트가 없거나 비어있습니다. 기본 시간 설정을 사용합니다.")
+            snapshots = pd.date_range(
+                start='2024-01-01 00:00:00',
+                end='2025-01-01 00:00:00',
+                freq='1h',
                 inclusive='left'
             )
             network.set_snapshots(snapshots)
@@ -784,7 +795,7 @@ def create_network(input_data):
                         print(f"열 보강 발전기 추가(확장가능/매우고비용): {fallback_name} (버스 {bus})")
                     continue
                 # 전력 버스: LNG 보완발전기(확장가능/매우고비용) 추가 — 실제 전력부하가 있을 때만
-                if bus_carrier == 'electricity':
+                if bus_carrier == 'electricity' or bus_carrier == 'AC':
                     has_el_load = False
                     try:
                         total = 0.0
@@ -818,9 +829,12 @@ def create_network(input_data):
                                    carrier='gas')
                         network.generators_t.p_max_pu[fallback_name] = pd.Series(1.0, index=network.snapshots)
                         print(f"전력 보완 발전기 추가(확장가능/매우고비용): {fallback_name} (버스 {bus})")
-                    # 옵션: 전력 슬랙 발전기(무한 확장/초고비용) 추가 - CO2 제약으로 LNG가 막힐 때 대비
+                    # 전력 슬랙 발전기(무한 확장/초고비용) 추가 - infeasible 방지를 위해 기본 활성화
                     try:
-                        if os.environ.get('ENABLE_POWER_SLACK', '0') == '1':
+                        # infeasible 방지를 위해 기본적으로 활성화 (DISABLE_POWER_SLACK=1로 비활성화 가능)
+                        disable_slack = os.environ.get('DISABLE_POWER_SLACK', '0')
+                        print(f"DEBUG: DISABLE_POWER_SLACK={disable_slack}, 버스 {bus}")
+                        if disable_slack != '1':
                             slack_name = f"{bus}_Slack_Gen"
                             if slack_name not in network.generators.index:
                                 slack_cost = float(os.environ.get('SLACK_GEN_COST', '1e9'))
@@ -829,11 +843,13 @@ def create_network(input_data):
                                            bus=bus,
                                            p_nom=0.0,
                                            p_nom_extendable=True,
+                                           p_nom_min=0.0,
+                                           p_nom_max=1e6,  # 매우 큰 확장 한계
                                            capital_cost=0.0,
                                            marginal_cost=slack_cost,
-                                           carrier='electricity')
+                                           carrier='AC')
                                 network.generators_t.p_max_pu[slack_name] = pd.Series(1.0, index=network.snapshots)
-                                print(f"전력 슬랙 발전기 추가(옵션/초고비용): {slack_name} (버스 {bus}, mcost={slack_cost})")
+                                print(f"전력 슬랙 발전기 추가(infeasible 방지): {slack_name} (버스 {bus}, mcost={slack_cost})")
                     except Exception as _e_sl:
                         print(f"슬랙 발전기 추가 경고: {_e_sl}")
                 # 수소 버스: 수소 백업기(필요시)
@@ -924,8 +940,8 @@ def create_network(input_data):
                 network.loads_t.p_set[name] = series
                 print(f"부하 추가됨: {name} (버스: {bus_name})")
         
-        # 시나리오 수요 스케일링 적용
-        _apply_scenario_demand_scaling(network, input_data)
+        # 시나리오 수요 스케일링 비활성화 (지역별 시트 원본 데이터 사용)
+        # _apply_scenario_demand_scaling(network, input_data)
         
         # 스케일링 이후 사후 백업 발전기 보강(전력/열 버스 대상)
         try:
@@ -1114,14 +1130,27 @@ def create_network(input_data):
                     except Exception:
                         pnom_val = float('nan')
                     if (pnom_raw is None) or (pd.isna(pnom_val)):
-                        pnom_val = float(link['p_nom']) if ('p_nom' in links_df.columns and pd.notna(link.get('p_nom'))) else 100.0
+                        # 시트에 p_nom 컬럼이 있는지 확인
+                        if 'p_nom' in links_df.columns:
+                            sheet_pnom = link.get('p_nom')
+                            if pd.notna(sheet_pnom):
+                                pnom_val = float(sheet_pnom)
+                            else:
+                                # NaN인 경우, HP는 0으로 기본 설정, 다른 링크는 100
+                                if 'hp' in link_name.lower():
+                                    pnom_val = 0.0  # HP는 0으로 기본 설정
+                                    print(f"HP 링크 {link_name}: p_nom이 NaN이므로 0으로 설정")
+                                else:
+                                    pnom_val = 100.0
+                        else:
+                            pnom_val = 100.0  # 진짜로 컬럼이 없을 때만 기본값 사용
                     
                     params = {
                         'name': link_name,
                         'bus0': bus0_name,
                         'bus1': bus1_name,
                         'p_nom': pnom_val,
-                        'efficiency': float(eff1_val) if pd.notna(eff1_val) else (float(link['efficiency']) if ('efficiency' in links_df.columns and pd.notna(link.get('efficiency'))) else (0.5 if ('electrolyser' in link_name.lower() or 'electrolyzer' in link_name.lower()) else 0.9))
+                        'efficiency': float(eff1_val) if pd.notna(eff1_val) else (0.5 if ('electrolyser' in link_name.lower() or 'electrolyzer' in link_name.lower()) else 0.9)
                     }
 
                     # 열 공급 우선순위 유도: CHP < HP < Fallback
@@ -4040,27 +4069,10 @@ def main():
     # 통합 입력 자동 생성/업데이트
     ensure_integrated_input()
 
-    # 3개 연도 멀티년 분석 실행 (시나리오 연도 목록의 처음 3개)
-    try:
-        print("단일년도(2024) 분석 준비 중...")
-        # 단일 연도를 고정 실행
-        target_years = [2024]
-        overrides_by_year = build_overrides_for_years(years=target_years, base_input_file=INPUT_FILE)
-        if overrides_by_year is not None:
-            years = target_years
-            print(f"단일년도 실행 연도: {years}")
-            # 단년도일 경우 carryover 비활성화
-            carry = False
-            results = run_multi_year_sequence(years, base_input_file=INPUT_FILE, overrides_by_year=overrides_by_year, carryover=carry, results_root='results_multi_3years')
-            print(f"단일년도 분석 완료. 대상 연도: {list(results.keys())}")
-            return
-        else:
-            print("경고: 시나리오 연도를 찾지 못했습니다. 단일년도 경로로 실행합니다.")
-    except Exception as e:
-        print(f"다년도 분석 준비 중 오류: {str(e)}")
-        print("단일년도 경로로 대체 실행합니다.")
-
-    # 단일년도 폴백 실행
+    # 시나리오 오버라이드 비활성화 - 지역별 시트에서 직접 값 사용
+    print("지역별 시트 원본 데이터 사용 모드로 실행...")
+    
+    # 단일년도 폴백 실행 (시나리오 오버라이드 없이)
     print("데이터 로드 시작...")
     input_data = read_input_data(INPUT_FILE)
     if input_data is None:
