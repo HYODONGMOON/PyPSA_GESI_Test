@@ -18,13 +18,33 @@ def _ensure_proj_lib_env():
             try:
                 if c and _os.path.exists(c):
                     _os.environ['PROJ_LIB'] = c
+                    print(f"[OK] PROJ_LIB 설정됨: {c}")
                     break
             except Exception:
                 continue
-    except Exception:
-        pass
+        
+        # 설정 실패 시 경고
+        if 'PROJ_LIB' not in _os.environ:
+            print("[경고] PROJ_LIB 환경변수 설정 실패 - 지도 시각화에 문제가 발생할 수 있습니다.")
+    except Exception as e:
+        print(f"[경고] PROJ_LIB 설정 중 오류: {e}")
 
 _ensure_proj_lib_env()
+
+# pyproj 및 지리 관련 경고 무시
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, message='.*pyproj.*')
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+# PyPSA import 전에 pyproj 설정 강제
+try:
+    import pyproj
+    # PROJ_LIB 강제 설정
+    if 'PROJ_LIB' in _os.environ:
+        pyproj.datadir.set_data_dir(_os.environ['PROJ_LIB'])
+except Exception as e:
+    print(f"[경고] pyproj 설정 경고 (무시 가능): {e}")
+
 import pypsa
 import pandas as pd
 import numpy as np
@@ -290,11 +310,11 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
             return None
         df = input_data['load_patterns'].copy()
 
-        # 1) 고정 위치(B8:D8765)에서 직접 읽기 시도
+        # 1) 고정 위치(B8:F8765)에서 직접 읽기 시도 [EV 패턴 복구]
         try:
             base_len = 8760
             start_row = 7  # Excel 8행 → iloc 7
-            col_map = {'EL': 1, 'H': 2, 'H2': 3}  # B,C,D
+            col_map = {'EL': 1, 'H': 2, 'H2': 3, 'EV_DRIVING': 4, 'EV_CHARGING': 5}  # B,C,D,E,F
             if demand_type in col_map and df.shape[0] > start_row + 10 and df.shape[1] > col_map[demand_type]:
                 series = pd.to_numeric(df.iloc[start_row:, col_map[demand_type]], errors='coerce')
                 values = series.dropna().astype(float).values
@@ -313,7 +333,13 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
                         pattern_full = np.tile(pattern_base, repeats)[:snapshots_len]
                     # 디버그 로그
                     try:
-                        label = {'EL': '전력(B열)', 'H': '열(C열)', 'H2': '수소(D열)'}[demand_type]
+                        label = {
+                            'EL': '전력(B열)', 
+                            'H': '열(C열)', 
+                            'H2': '수소(D열)',
+                            'EV_DRIVING': 'EV주행(E열)',
+                            'EV_CHARGING': 'EV충전(F열)'
+                        }[demand_type]
                         sample_n = min(8, len(pattern_base))
                         print(f"load_patterns 고정위치 사용: {label}, 시작행 Excel 8행 기준")
                         print(f"패턴 길이(기본): {len(pattern_base)} (최대 {np.nanmax(pattern_base):.6f}, 평균 {np.nanmean(pattern_base):.6f})")
@@ -367,7 +393,9 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
         candidates_by_type = {
             'EL': [f"{region}_EL", f"{region}_electricity", 'EL', 'electricity', '전력'],
             'H': [f"{region}_H", f"{region}_heating", 'H', 'heat', 'heating', '열'],
-            'H2': [f"{region}_H2", f"{region}_hydrogen", 'H2', 'hydrogen', '수소']
+            'H2': [f"{region}_H2", f"{region}_hydrogen", 'H2', 'hydrogen', '수소'],
+            'EV_DRIVING': [f"{region}_EV_DRIVING", 'EV_DRIVING', 'EV주행', '전기차주행'],
+            'EV_CHARGING': [f"{region}_EV_CHARGING", 'EV_CHARGING', 'EV충전', '전기차충전']
         }
         candidates = candidates_by_type.get(demand_type, [])
         # 지역 무관 전역 후보 추가
@@ -377,6 +405,10 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
             candidates += ['H', 'heat', 'heating', '열']
         elif demand_type == 'H2':
             candidates += ['H2', 'hydrogen', '수소']
+        elif demand_type == 'EV_DRIVING':
+            candidates += ['EV_DRIVING', 'EV주행', '전기차주행']
+        elif demand_type == 'EV_CHARGING':
+            candidates += ['EV_CHARGING', 'EV충전', '전기차충전']
         # 기본 패턴 컬럼
         candidates += ['pattern']
 
@@ -467,13 +499,13 @@ def create_network(input_data):
     try:
         network = pypsa.Network()
         
-        # carriers 정의
+        # carriers 정의 (PyPSA 내부 배출계수 활용)
         carriers = {
             'AC': {'name': 'AC', 'co2_emissions': 0},
             'DC': {'name': 'DC', 'co2_emissions': 0},
             'electricity': {'name': 'electricity', 'co2_emissions': 0},
-            'coal': {'name': 'coal', 'co2_emissions': 0.9},
-            'gas': {'name': 'gas', 'co2_emissions': 0.4},
+            'coal': {'name': 'coal', 'co2_emissions': 0.8384},  # 정확한 한국 석탄 배출계수
+            'gas': {'name': 'gas', 'co2_emissions': 0.38},      # 정확한 한국 LNG 배출계수
             'nuclear': {'name': 'nuclear', 'co2_emissions': 0},
             'solar': {'name': 'solar', 'co2_emissions': 0},
             'wind': {'name': 'wind', 'co2_emissions': 0},
@@ -500,7 +532,7 @@ def create_network(input_data):
             snapshots_length = len(snapshots)
         else:
             # 기본 시간 설정 (2024년 1년간, 1시간 간격)
-            print("⚠️ timeseries 시트가 없거나 비어있습니다. 기본 시간 설정을 사용합니다.")
+            print("[경고] timeseries 시트가 없거나 비어있습니다. 기본 시간 설정을 사용합니다.")
             snapshots = pd.date_range(
                 start='2024-01-01 00:00:00',
                 end='2025-01-01 00:00:00',
@@ -517,7 +549,7 @@ def create_network(input_data):
                 bus_name = str(bus['name'])
                 raw_carrier = str(bus['carrier'])
                 token = _standardize_bus_token_by_carrier(raw_carrier)
-                carrier_map = {'EL': 'electricity', 'H': 'heat', 'H2': 'hydrogen', 'LNG': 'gas'}
+                carrier_map = {'EL': 'electricity', 'H': 'heat', 'H2': 'hydrogen', 'LNG': 'gas', 'EV': 'electricity'}
                 carrier = carrier_map.get(token, raw_carrier)
                 
                 v_nom_val = float(bus['v_nom']) if pd.notna(bus['v_nom']) else 345.0
@@ -568,7 +600,7 @@ def create_network(input_data):
                             print(f"WT 패턴 준비됨 - 길이: {len(wt_pattern)}, 최대값: {np.max(wt_pattern):.3f}, 최소값: {np.min(wt_pattern):.3f}")
             
             if not renewable_patterns:
-                print("⚠️ 재생에너지 패턴을 찾을 수 없습니다. 기본값 1.0을 사용합니다.")
+                print("[경고] 재생에너지 패턴을 찾을 수 없습니다. 기본값 1.0을 사용합니다.")
         
         # 발전기 추가
         if 'generators' in input_data:
@@ -589,12 +621,38 @@ def create_network(input_data):
                 if norm_bus != raw_bus:
                     print(f"발전기 {gen_name} 버스명 정규화: {raw_bus} → {norm_bus}")
                 
+                # 발전기 이름 기반으로 올바른 carrier 설정 (CO2 제약조건을 위해)
+                def get_correct_carrier(gen_name, original_carrier):
+                    """발전기 이름에서 올바른 carrier 추론"""
+                    gen_lower = gen_name.lower()
+                    if any(keyword in gen_lower for keyword in ['coal', '석탄']):
+                        return 'coal'
+                    elif any(keyword in gen_lower for keyword in ['lng', 'gas', 'chp', '가스', 'slack', 'fallback']):
+                        return 'gas'  # 슬랙/폴백 발전기도 LNG 기반으로 처리
+                    elif any(keyword in gen_lower for keyword in ['nuclear', '원자력']):
+                        return 'nuclear'
+                    elif any(keyword in gen_lower for keyword in ['pv', 'solar', '태양']):
+                        return 'solar'
+                    elif any(keyword in gen_lower for keyword in ['wind', 'wt', '풍력']):
+                        return 'wind'
+                    else:
+                        # 원본 carrier가 유효하면 사용, 아니면 electricity
+                        orig = str(original_carrier).lower()
+                        if orig in ['coal', 'gas', 'nuclear', 'solar', 'wind']:
+                            return orig
+                        return 'electricity'
+                
+                correct_carrier = get_correct_carrier(gen_name, gen['carrier'])
+                
                 params = {
                     'name': gen_name,
                     'bus': norm_bus,
                     'p_nom': p_nom_value,
-                    'carrier': str(gen['carrier'])
+                    'carrier': correct_carrier
                 }
+                
+                if correct_carrier != str(gen['carrier']):
+                    print(f"  [수정] {gen_name}: carrier 수정 {gen['carrier']} → {correct_carrier}")
                 
                 # 나머지 파라미터 추가
                 optional_params = ['p_nom_extendable', 'marginal_cost', 'capital_cost', 'efficiency', 'p_min_pu', 'p_nom_min', 'p_nom_max']
@@ -621,11 +679,16 @@ def create_network(input_data):
                 # 패턴 길이 확인 및 조정
                 pattern = renewable_patterns['PV_pattern']
                 if len(pattern) != len(network.snapshots):
-                    print(f"⚠️ PV 패턴 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
+                    print(f"[경고] PV 패턴 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
                     pattern = adjust_pattern_length(pattern, len(network.snapshots))
                 
+                # 패턴을 p_max_pu에 직접 적용
                 network.generators_t.p_max_pu[gen_name] = pattern
-                print(f"{gen_name}에 PV 패턴 적용됨 (길이: {len(pattern)}, 평균: {np.mean(pattern):.3f}, 최대: {np.max(pattern):.3f})")
+                
+                original_p_nom = network.generators.at[gen_name, 'p_nom']
+                pattern_sum = np.sum(pattern)
+                pattern_stats = f"패턴 합={pattern_sum:.6f}, 최대={np.max(pattern):.6f}"
+                print(f"{gen_name}: p_nom={original_p_nom:.1f}MW, {pattern_stats}")
                 pv_applied_count += 1
                 pattern_applied = True
             
@@ -634,17 +697,22 @@ def create_network(input_data):
                 # 패턴 길이 확인 및 조정
                 pattern = renewable_patterns['WT_pattern']
                 if len(pattern) != len(network.snapshots):
-                    print(f"⚠️ WT 패턴 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
+                    print(f"[경고] WT 패턴 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
                     pattern = adjust_pattern_length(pattern, len(network.snapshots))
                 
+                # 패턴을 p_max_pu에 직접 적용
                 network.generators_t.p_max_pu[gen_name] = pattern
-                print(f"{gen_name}에 WT 패턴 적용됨 (길이: {len(pattern)}, 평균: {np.mean(pattern):.3f}, 최대: {np.max(pattern):.3f})")
+                
+                original_p_nom = network.generators.at[gen_name, 'p_nom']
+                pattern_sum = np.sum(pattern)
+                pattern_stats = f"패턴 합={pattern_sum:.6f}, 최대={np.max(pattern):.6f}"
+                print(f"{gen_name}: p_nom={original_p_nom:.1f}MW, {pattern_stats}")
                 wt_applied_count += 1
                 pattern_applied = True
             
             # 패턴이 적용되지 않은 재생에너지 발전기 확인
             if not pattern_applied and any(keyword in gen_name.lower() for keyword in ['pv', 'solar', 'wind', 'wt']):
-                print(f"⚠️ 재생에너지 발전기 {gen_name}에 패턴이 적용되지 않음")
+                print(f"[경고] 재생에너지 발전기 {gen_name}에 패턴이 적용되지 않음")
         
         print(f"\n재생에너지 패턴 적용 완료:")
         print(f"- PV 패턴 적용: {pv_applied_count}개 발전기")
@@ -667,9 +735,10 @@ def create_network(input_data):
                     pattern_values = network.generators_t.p_max_pu[gen_name]
                     print(f"{gen_name}: 패턴 적용됨 - 평균 {np.mean(pattern_values):.3f}, 변동성 {np.std(pattern_values):.3f}")
                 else:
-                    print(f"⚠️ {gen_name}: 패턴 적용되지 않음 - 기본값 1.0 사용")
+                    print(f"[경고] {gen_name}: 패턴 적용되지 않음 - 기본값 1.0 사용")
         
         # 발전기 효율 및 최대/최소 출력비율(p_max_pu/p_min_pu) 반영
+        # [경고] 재생에너지(PV, WT)는 패턴이 이미 적용되었으므로 추가 처리 제외
         try:
             gdf = input_data.get('generators', pd.DataFrame())
             if not gdf.empty:
@@ -678,6 +747,13 @@ def create_network(input_data):
                     gname = str(row.get('name', '')).strip()
                     if not gname or gname not in network.generators.index:
                         continue
+                    
+                    # 재생에너지 발전기는 이미 패턴이 적용되었으므로 효율 곱셈 건너뜀
+                    is_renewable = any(keyword in gname.lower() for keyword in ['pv', 'solar', 'wind', 'wt'])
+                    if is_renewable:
+                        print(f"재생에너지 {gname}: 패턴 유지, 효율 적용 건너뜀")
+                        continue
+                    
                     # 효율
                     eff = pd.to_numeric(row.get('efficiency'), errors='coerce')
                     if pd.isna(eff) and '효율' in cols:
@@ -712,9 +788,14 @@ def create_network(input_data):
                         print(msg)
                     except Exception:
                         pass
-            # p_min_pu <= p_max_pu 보정
+            # p_min_pu <= p_max_pu 보정 (재생에너지 제외)
             try:
                 for gname in network.generators.index:
+                    # 재생에너지는 패턴이 p_max_pu에만 적용되고 p_min_pu=0이므로 보정 제외
+                    is_renewable = any(keyword in gname.lower() for keyword in ['pv', 'solar', 'wind', 'wt'])
+                    if is_renewable:
+                        continue
+                    
                     if gname in network.generators_t.p_max_pu.columns:
                         pmax = network.generators_t.p_max_pu[gname].fillna(0.0)
                     else:
@@ -847,7 +928,7 @@ def create_network(input_data):
                                            p_nom_max=1e6,  # 매우 큰 확장 한계
                                            capital_cost=0.0,
                                            marginal_cost=slack_cost,
-                                           carrier='AC')
+                                           carrier='gas')  # 슬랙 발전기를 LNG 기반으로 설정하여 배출량 계산
                                 network.generators_t.p_max_pu[slack_name] = pd.Series(1.0, index=network.snapshots)
                                 print(f"전력 슬랙 발전기 추가(infeasible 방지): {slack_name} (버스 {bus}, mcost={slack_cost})")
                     except Exception as _e_sl:
@@ -911,19 +992,31 @@ def create_network(input_data):
                 if 'load_patterns' in input_data:
                     # 부하 이름에서 지역과 타입 추출
                     region = name.split('_')[0] if '_' in name else None
-                    dtype = 'EL' if '_Demand_EL' in name else ('H2' if '_Demand_H2' in name else ('H' if '_Demand_H' in name else None))
-                    pattern = _get_load_pattern(input_data, region, dtype, len(snapshots)) if region and dtype else None
-
-                    if pattern is not None:
-                        # 총수요 × 8760 × 패턴(스케일 없이 그대로 적용)
-                        p_set = float(p_set) * 8760.0 * pattern
-                        print(f"부하 {name}에 패턴 적용됨 (총수요×8760×패턴)")
+                    # 부하 타입 감지 (EV 포함)
+                    if '_Demand_EL' in name:
+                        dtype = 'EL'
+                    elif '_Demand_H2' in name:
+                        dtype = 'H2'
+                    elif '_Demand_H' in name:
+                        dtype = 'H'
+                    elif '_Demand_EV' in name or '_EV' in name:
+                        dtype = 'EV_DRIVING'  # EV 수요 패턴 적용
                     else:
-                        cols = list(input_data['load_patterns'].columns) if 'load_patterns' in input_data else []
-                        print(f"부하 {name}: 패턴 미발견 (region={region}, type={dtype}), 사용 가능 컬럼: {cols[:10]}{'...' if len(cols)>10 else ''}")
-                        # 패턴이 없는 경우 일정한 부하
-                        p_set = np.full(len(snapshots), p_set)
-                        print(f"부하 {name}에 일정한 부하 적용됨")
+                        dtype = None
+                    
+                    # 패턴 적용
+                    if dtype is not None:
+                        pattern = _get_load_pattern(input_data, region, dtype, len(snapshots)) if region else None
+                        if pattern is not None:
+                            # 총수요 × 8760 × 패턴(스케일 없이 그대로 적용)
+                            p_set = float(p_set) * 8760.0 * pattern
+                            print(f"부하 {name}에 패턴 적용됨 (총수요×8760×패턴, 타입={dtype})")
+                        else:
+                            cols = list(input_data['load_patterns'].columns) if 'load_patterns' in input_data else []
+                            print(f"부하 {name}: 패턴 미발견 (region={region}, type={dtype}), 사용 가능 컬럼: {cols[:10]}{'...' if len(cols)>10 else ''}")
+                            # 패턴이 없는 경우 일정한 부하
+                            p_set = np.full(len(snapshots), p_set)
+                            print(f"부하 {name}에 일정한 부하 적용됨")
                 else:
                     p_set = np.full(len(snapshots), p_set)
                 
@@ -1150,7 +1243,8 @@ def create_network(input_data):
                         'bus0': bus0_name,
                         'bus1': bus1_name,
                         'p_nom': pnom_val,
-                        'efficiency': float(eff1_val) if pd.notna(eff1_val) else (0.5 if ('electrolyser' in link_name.lower() or 'electrolyzer' in link_name.lower()) else 0.9)
+                        'efficiency': float(eff1_val) if pd.notna(eff1_val) else (0.5 if ('electrolyser' in link_name.lower() or 'electrolyzer' in link_name.lower()) else 0.9),
+                        'carrier': 'gas' if is_chp_link else 'electricity'  # CHP는 가스 carrier로 설정
                     }
 
                     # 열 공급 우선순위 유도: CHP < HP < Fallback
@@ -1221,6 +1315,33 @@ def create_network(input_data):
                         print(f"Link {link_name} 추가 중 오류: {str(e)}")
                 else:
                     print(f"Link {link_name} 건너뜀: 유효하지 않은 버스 연결 (bus0: {bus0_name}, bus1: {bus1_name})")
+            
+            # # EV 충전 패턴 적용 (Links 추가 완료 후) [임시 비활성화 - unknown 에러 해결 필요]
+            # print("\n=== EV 충전 패턴 적용 시작 ===")
+            # if 'load_patterns' in input_data:
+            #     ev_charging_pattern = _get_load_pattern(input_data, None, 'EV_CHARGING', len(snapshots))
+            #     if ev_charging_pattern is not None:
+            #         ev_charger_count = 0
+            #         for link_name in network.links.index:
+            #             # EV_Charger 링크 감지 (이름에 'EV_Charger', 'EV_charger', 'ev_charger' 포함)
+            #             if 'ev' in link_name.lower() and 'charg' in link_name.lower():
+            #                 # p_max_pu에 충전 가능 패턴 적용
+            #                 network.links_t.p_max_pu[link_name] = ev_charging_pattern
+            #                 print(f"Link {link_name}에 EV 충전 패턴 적용됨 (p_max_pu)")
+            #                 ev_charger_count += 1
+            #         
+            #         if ev_charger_count > 0:
+            #             print(f"총 {ev_charger_count}개 EV Charger 링크에 충전 패턴 적용 완료")
+            #             # 패턴 샘플 출력
+            #             sample_n = min(8, len(ev_charging_pattern))
+            #             print(f"EV 충전 패턴 샘플 (0~{sample_n-1}시): {np.round(ev_charging_pattern[:sample_n], 4).tolist()}")
+            #             print(f"EV 충전 패턴 통계: 최소={np.min(ev_charging_pattern):.4f}, 최대={np.max(ev_charging_pattern):.4f}, 평균={np.mean(ev_charging_pattern):.4f}")
+            #         else:
+            #             print("[경고] EV Charger 링크를 찾지 못했습니다.")
+            #     else:
+            #         print("[경고] load_patterns 시트에서 EV_CHARGING(F열) 패턴을 찾지 못했습니다.")
+            # else:
+            #     print("[경고] load_patterns 시트가 없어 EV 충전 패턴을 적용할 수 없습니다.")
         
         # 저장장치 추가
         if 'stores' in input_data:
@@ -1231,11 +1352,13 @@ def create_network(input_data):
                 
                 # 버스 존재 확인
                 if bus_name in network.buses.index:
+                    e_nom_val = float(store['e_nom']) if pd.notna(store['e_nom']) else 0
+                    
                     params = {
                         'name': store_name,
                         'bus': bus_name,
                         'carrier': str(store['carrier']),
-                        'e_nom': float(store['e_nom']) if pd.notna(store['e_nom']) else 0,
+                        'e_nom': e_nom_val,
                         'e_cyclic': _to_bool(store['e_cyclic']) if 'e_cyclic' in store and pd.notna(store['e_cyclic']) else True,
                         'efficiency_store': float(store['efficiency_store']) if 'efficiency_store' in store and pd.notna(store['efficiency_store']) else 0.9,
                         'efficiency_dispatch': float(store['efficiency_dispatch']) if 'efficiency_dispatch' in store and pd.notna(store['efficiency_dispatch']) else 0.9,
@@ -1245,10 +1368,31 @@ def create_network(input_data):
                     if 'e_nom_extendable' in store and pd.notna(store['e_nom_extendable']):
                         params['e_nom_extendable'] = _to_bool(store['e_nom_extendable'])
                     
+                    # 용량 확장 하한/상한 (extendable일 때)
                     if 'e_nom_min' in store and pd.notna(store['e_nom_min']):
                         params['e_nom_min'] = float(store['e_nom_min'])
                     if 'e_nom_max' in store and pd.notna(store['e_nom_max']):
                         params['e_nom_max'] = float(store['e_nom_max'])
+                    
+                    # 운영 중 최소 잔량 (비율) - e_min_pu [활성화 복구]
+                    # Excel 컬럼명: "e_min_pu" 또는 "최소잔량" (0~1 비율로 입력)
+                    e_min_pu_col = None
+                    if 'e_min_pu' in store and pd.notna(store['e_min_pu']):
+                        e_min_pu_col = 'e_min_pu'
+                    elif '최소잔량' in store and pd.notna(store['최소잔량']):
+                        e_min_pu_col = '최소잔량'
+                    
+                    if e_min_pu_col:
+                        e_min_pu_val = float(store[e_min_pu_col])
+                        # 0~1 범위 제한
+                        params['e_min_pu'] = min(max(e_min_pu_val, 0.0), 1.0)
+                        print(f"  {store_name}: e_min_pu={params['e_min_pu']:.2f} (최소잔량 {params['e_min_pu']*100:.0f}%) [from {e_min_pu_col}]")
+                    
+                    # 운영 중 최대 잔량 (비율) - e_max_pu (선택적) [활성화 복구]
+                    if 'e_max_pu' in store and pd.notna(store['e_max_pu']):
+                        e_max_pu_val = float(store['e_max_pu'])
+                        params['e_max_pu'] = min(max(e_max_pu_val, 0.0), 1.0)
+                        print(f"  {store_name}: e_max_pu={params['e_max_pu']:.2f} (최대잔량 {params['e_max_pu']*100:.0f}%)")
                     
                     network.add("Store", **params)
                     print(f"저장장치 {store_name} 추가됨 (버스: {bus_name})")
@@ -1260,17 +1404,54 @@ def create_network(input_data):
             print("\n=== 선로 추가 시작 ===")
             added_lines = 0
             skipped_lines = 0
+            conditional_lines = 0  # RPS 조건부 선로 카운트
+            
+            # RPS 제약 여부 확인
+            has_rps = False
+            if hasattr(network, 'rps_constraints') and network.rps_constraints:
+                has_rps = True
+            elif 'constraints' in input_data and not input_data['constraints'].empty:
+                try:
+                    constraints_df = input_data['constraints'].copy()
+                    if 'type' in constraints_df.columns or '유형' in constraints_df.columns:
+                        type_col = 'type' if 'type' in constraints_df.columns else '유형'
+                        has_rps = any(constraints_df[type_col].astype(str).str.upper() == 'RPS')
+                except:
+                    pass
+            
+            print(f"RPS 제약 존재: {has_rps}")
             
             for _, line in input_data['lines'].iterrows():
                 line_name = str(line['name'])
                 bus0_name = str(line['bus0'])
                 bus1_name = str(line['bus1'])
                 
+                # 조건부 활성화 체크 (enable_condition 컬럼)
+                enable_condition = None
+                if 'enable_condition' in line and pd.notna(line['enable_condition']):
+                    enable_condition = str(line['enable_condition']).strip().upper()
+                
+                # RPS 조건부 선로 처리
+                if enable_condition == 'RPS':
+                    if not has_rps:
+                        # RPS 제약이 없으면 이 선로는 추가하지 않음
+                        print(f"선로 {line_name} 건너뜀: RPS 제약 없음 (조건부 RE 송전선)")
+                        skipped_lines += 1
+                        conditional_lines += 1
+                        continue
+                    else:
+                        print(f"선로 {line_name}: RPS 조건 만족 → RE Ring 송전선 활성화")
+                
                 # 버스 이름 정규화
                 defined_buses = set(network.buses.index)
                 bus_carriers = dict(zip(network.buses.index, network.buses.carrier))
-                bus0_name_norm = _normalize_bus_name(bus0_name, defined_buses, True, bus_carriers)
-                bus1_name_norm = _normalize_bus_name(bus1_name, defined_buses, True, bus_carriers)
+                
+                # RE 버스 간 연결은 prefer_electric=False로 설정하여 원래 이름 유지
+                is_re_connection = ('_RE' in str(bus0_name) or '_RE' in str(bus1_name))
+                prefer_electric = not is_re_connection  # RE 연결이면 False, 아니면 True
+                
+                bus0_name_norm = _normalize_bus_name(bus0_name, defined_buses, prefer_electric, bus_carriers)
+                bus1_name_norm = _normalize_bus_name(bus1_name, defined_buses, prefer_electric, bus_carriers)
                 
                 # 선로 이름에서 지역코드 강제 추출 후 전력버스로 강제 매핑 시도 (예: GND_JND → GND_EL, JND_EL)
 
@@ -1371,6 +1552,11 @@ def create_network(input_data):
                         print(f"  누락된 버스: {bus1_name}")
             
             print(f"\n선로 추가 요약: 성공 {added_lines}개, 실패 {skipped_lines}개")
+            if conditional_lines > 0:
+                if has_rps:
+                    print(f"  - RPS 조건부 RE Ring 송전선: {conditional_lines}개 활성화됨")
+                else:
+                    print(f"  - RPS 조건부 RE Ring 송전선: {conditional_lines}개 비활성화됨")
             print(f"네트워크에 추가된 총 선로 수: {len(network.lines)}")
             
             # 버스 목록 확인
@@ -1392,7 +1578,7 @@ def create_network(input_data):
         except Exception as _e_eff:
             print(f"링크 효율 보정 경고: {_e_eff}")
         
-        # CO2 제약 추가 (한글/영문 헤더 모두 지원)
+        # 제약조건 추가 (CO2, RPS 등)
         if os.environ.get('DISABLE_CO2_LIMIT','0')=='1':
             print('CO2 제약 비활성화됨(DISABLE_CO2_LIMIT=1)')
         elif 'constraints' in input_data and not input_data['constraints'].empty:
@@ -1400,10 +1586,11 @@ def create_network(input_data):
             # 컬럼 표준화
             rename_map = {
                 '이름': 'name', 'name': 'name',
-                '상수': 'constant', 'constant': 'constant',
+                '상수': 'constant', 'constant': 'constant', '상수값': 'constant',
                 '조건': 'sense', 'sense': 'sense',
                 '유형': 'type', 'type': 'type',
-                '대상속성': 'carrier_attribute', 'carrier_attribute': 'carrier_attribute'
+                '대상속성': 'carrier_attribute', 'carrier_attribute': 'carrier_attribute',
+                '적용지역': 'region', 'region': 'region', '적용 지역': 'region'
             }
             std_cols = {}
             for c in constraints_df.columns:
@@ -1411,25 +1598,56 @@ def create_network(input_data):
                 std_cols[c] = rename_map.get(key, key)
             constraints_df.rename(columns=std_cols, inplace=True)
 
+            # 1) CO2 제약 처리
             co2_limit = pd.DataFrame()
             if 'name' in constraints_df.columns:
-                co2_limit = constraints_df[constraints_df['name'].astype(str).str.strip() == 'CO2Limit']
+                # CO2_limit 또는 CO2Limit 모두 지원
+                co2_mask = constraints_df['name'].astype(str).str.strip().isin(['CO2_limit', 'CO2Limit'])
+                co2_limit = constraints_df[co2_mask]
 
             if not co2_limit.empty:
                 const_col = 'constant' if 'constant' in co2_limit.columns else None
                 if const_col:
                     limit_value = float(pd.to_numeric(co2_limit.iloc[0][const_col], errors='coerce'))
                     network.add("GlobalConstraint",
-                                "CO2Limit",
+                                name="CO2_limit",
+                                type="primary_energy",
+                                carrier_attribute="co2_emissions",
                                 sense="<=",
                                 constant=limit_value)
-                    print(f"CO2 제약이 {limit_value} tCO2로 설정되었습니다.")
+                    print(f"[OK] PyPSA CO2 배출량 제약조건 추가됨: ≤ {limit_value/1e6:.1f}백만톤")
+                    print(f"   올바른 carrier 설정으로 실제 제약조건 적용됩니다.")
                 else:
                     print("경고: constraints 시트에 'constant' 컬럼이 없어 CO2Limit을 적용하지 못했습니다.")
-            else:
-                print("경고: CO2Limit 행이 없습니다.")
+            
+            # 2) RPS (재생에너지 의무 비중) 제약 처리
+            if 'type' in constraints_df.columns:
+                rps_mask = constraints_df['type'].astype(str).str.strip().str.upper() == 'RPS'
+                rps_constraints = constraints_df[rps_mask]
+                
+                if not rps_constraints.empty:
+                    print(f"\n[RE] 재생에너지 의무 비중(RPS) 제약 추가 중...")
+                    network.rps_constraints = []
+                    
+                    for _, rps_row in rps_constraints.iterrows():
+                        try:
+                            rps_name = str(rps_row.get('name', 'RPS')).strip()
+                            region = str(rps_row.get('region', 'ALL')).strip()
+                            share = float(pd.to_numeric(rps_row.get('constant', 0.2), errors='coerce'))
+                            
+                            network.rps_constraints.append({
+                                'name': rps_name,
+                                'region': region,
+                                'share': share
+                            })
+                            
+                            print(f"   [OK] {rps_name}: {region} 지역 재생에너지 비중 ≥ {share*100:.1f}%")
+                        except Exception as e:
+                            print(f"   [경고]  RPS 제약 '{rps_row.get('name', 'Unknown')}' 추가 실패: {str(e)}")
+                    
+                    print(f"   총 {len(network.rps_constraints)}개 RPS 제약 설정됨")
         else:
-            print("경고: constraints 시트에 'name' 컬럼이 없어 전역 제약을 적용하지 못했습니다.")
+            print("경고: constraints 시트가 없거나 비어있습니다.")
         
         # 최종 안전장치: 여전히 수요 충족이 불가할 경우 초고비용 슬랙 발전기 추가
         try:
@@ -1540,11 +1758,135 @@ def optimize_network(network):
         except Exception:
             pass
         
-        # 최적화 옵션 세트(순차 폴백)
+        # RPS 제약조건 적용 (최적화 전 모델에 추가) - 임시 비활성화
+        if False:  # hasattr(network, 'rps_constraints') and network.rps_constraints:
+            print("\n[RE] RPS 제약조건을 모델에 추가 중...")
+            try:
+                # 모델 생성 (optimize 전에 수동으로 생성)
+                network.optimize.create_model()
+                
+                for rps in network.rps_constraints:
+                    region = rps['region']
+                    share = rps['share']
+                    name = rps['name']
+                    
+                    # 1) 해당 지역의 전력 부하 총량 계산
+                    region_loads = network.loads[
+                        (network.loads['bus'].str.startswith(f'{region}_')) &
+                        (network.loads['bus'].str.contains('_EL'))
+                    ]
+                    if region_loads.empty:
+                        print(f"   [경고]  {name}: {region} 지역에 전력 부하가 없습니다.")
+                        continue
+                    
+                    # 시간별 수요 합계 계산
+                    total_demand = 0
+                    for load_name in region_loads.index:
+                        if load_name in network.loads_t.p_set.columns:
+                            total_demand += network.loads_t.p_set[load_name].sum()
+                    
+                    if total_demand <= 0:
+                        print(f"   [경고]  {name}: {region} 지역 전력 수요가 0입니다.")
+                        continue
+                    
+                    # 2) 해당 지역 RE 버스 찾기 (예: SEL_RE)
+                    re_bus = f"{region}_RE"
+                    if re_bus not in network.buses.index:
+                        print(f"   [경고]  {name}: {region} 지역에 RE 버스({re_bus})가 없습니다.")
+                        continue
+                    
+                    # 3) RE 버스로 유입되는 모든 전력 계산
+                    # 3-1) 지역 내 재생에너지 발전기 (RE 버스에 연결된 발전기)
+                    re_gens_local = network.generators[
+                        network.generators['bus'] == re_bus
+                    ].index.tolist()
+                    
+                    # 3-2) RE Ring 송전망을 통한 RE 유입/유출
+                    # Lines: 다른 지역 RE → 이 지역 RE (RE Ring)
+                    re_lines_in = network.lines[
+                        (network.lines['bus1'] == re_bus) &
+                        (network.lines['bus0'].str.contains('_RE'))
+                    ].index.tolist() if not network.lines.empty else []
+                    
+                    re_lines_out = network.lines[
+                        (network.lines['bus0'] == re_bus) &
+                        (network.lines['bus1'].str.contains('_RE'))
+                    ].index.tolist() if not network.lines.empty else []
+                    
+                    # Links: RE Ring을 링크로 구현한 경우
+                    re_links_in = network.links[
+                        (network.links['bus1'] == re_bus) &
+                        (network.links['bus0'].str.contains('_RE'))
+                    ].index.tolist() if not network.links.empty else []
+                    
+                    re_links_out = network.links[
+                        (network.links['bus0'] == re_bus) &
+                        (network.links['bus1'].str.contains('_RE'))
+                    ].index.tolist() if not network.links.empty else []
+                    
+                    has_re_ring = bool(re_lines_in or re_lines_out or re_links_in or re_links_out)
+                    
+                    # 4) linopy 제약조건 생성
+                    # RE 소비량 = 지역 RE 발전 + Ring 유입 - Ring 유출 >= 수요 × 비중
+                    
+                    # 지역 내 RE 발전
+                    if re_gens_local:
+                        re_supply = network.model["Generator-p"].loc[:, re_gens_local].sum(dims="Generator")
+                    else:
+                        # RE 발전기가 없는 경우, 0으로 초기화된 linopy 변수 생성
+                        import linopy
+                        re_supply = linopy.LinearExpression(None, model=network.model)
+                        re_supply = re_supply + 0  # 0으로 초기화
+                    
+                    # RE Ring 송전망을 통한 유입/유출
+                    if has_re_ring:
+                        # 선로 유입 (+p0은 bus0→bus1 방향)
+                        if re_lines_in:
+                            re_supply = re_supply + network.model["Line-s"].loc[:, re_lines_in].sum(dims="Line")
+                        
+                        # 선로 유출 (빼기)
+                        if re_lines_out:
+                            re_supply = re_supply - network.model["Line-s"].loc[:, re_lines_out].sum(dims="Line")
+                        
+                        # 링크 유입
+                        if re_links_in:
+                            re_supply = re_supply - network.model["Link-p"].loc[:, re_links_in].sum(dims="Link")
+                        
+                        # 링크 유출
+                        if re_links_out:
+                            re_supply = re_supply + network.model["Link-p"].loc[:, re_links_out].sum(dims="Link")
+                    
+                    min_re_consumption = total_demand * share
+                    
+                    # 제약조건 추가
+                    network.model.add_constraints(
+                        re_supply >= min_re_consumption,
+                        name=f"RPS-{region}"
+                    )
+                    
+                    gen_info = f"{len(re_gens_local)}개 발전기" if re_gens_local else "발전기 없음"
+                    ring_info = ""
+                    if has_re_ring:
+                        total_ring_paths = len(re_lines_in) + len(re_lines_out) + len(re_links_in) + len(re_links_out)
+                        ring_info = f", RE Ring: {total_ring_paths}개 경로"
+                    else:
+                        ring_info = ", RE Ring: 없음 (지역 내 발전만)"
+                    
+                    print(f"   [OK] {name}: {region} RE 소비 ≥ {min_re_consumption/1e6:.2f} GWh ({share*100:.1f}% of {total_demand/1e6:.2f} GWh)")
+                    print(f"      {gen_info}{ring_info}")
+                    
+                    if not re_gens_local and not has_re_ring:
+                        print(f"      [경고]  {region}은 RE 발전도 없고 RE Ring도 없어 RPS 달성 불가!")
+                
+                print(f"   [OK] RPS 제약조건 {len(network.rps_constraints)}개 추가 완료")
+            except Exception as e:
+                print(f"   [경고]  RPS 제약조건 추가 중 오류: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
+        # 최적화 옵션: Barrier 방법만 사용 (가장 빠름)
         option_variants = [
-            {'name': 'barrier',      'opts': {'threads': num_cores, 'lpmethod': 4, 'parallel': 1, 'barrier.algorithm': 3}},
-            {'name': 'dual-simplex', 'opts': {'threads': num_cores, 'lpmethod': 2, 'parallel': 1}},
-            {'name': 'primal-simplex','opts': {'threads': num_cores, 'lpmethod': 1, 'parallel': 1}}
+            {'name': 'barrier', 'opts': {'threads': num_cores, 'lpmethod': 4, 'parallel': 1, 'barrier.algorithm': 3}}
         ]
         
         last_status = None
@@ -1610,14 +1952,64 @@ def optimize_network(network):
 def extract_results(network):
     """주요 결과 추출"""
     
+    # 재생에너지 Curtailment 계산
+    re_curtailment = {}
+    for gen in network.generators.index:
+        if any(keyword in gen.lower() for keyword in ['pv', 'solar', 'wind', 'wt']):
+            if gen in network.generators_t.p_max_pu.columns and gen in network.generators_t.p.columns:
+                # 잠재 발전량 (curtailment 없을 때)
+                potential = (network.generators.loc[gen, 'p_nom'] * 
+                           network.generators_t.p_max_pu[gen])
+                
+                # 실제 발전량 (최적화 결과)
+                actual = network.generators_t.p[gen]
+                
+                # Curtailment (시간별)
+                curtailment = potential - actual
+                
+                if curtailment.sum() > 0.1:  # 0.1 MWh 이상만 기록
+                    re_curtailment[gen] = {
+                        'timeseries': curtailment,
+                        'total_MWh': curtailment.sum(),
+                        'potential_MWh': potential.sum(),
+                        'actual_MWh': actual.sum(),
+                        'curtailment_rate_%': (curtailment.sum() / potential.sum() * 100) if potential.sum() > 0 else 0
+                    }
+    
+    # storage_units_t 안전하게 처리
+    storage_state = None
+    try:
+        if hasattr(network, 'storage_units_t') and hasattr(network.storage_units_t, 'state_of_charge'):
+            if not network.storage_units_t.state_of_charge.empty:
+                storage_state = network.storage_units_t.state_of_charge
+    except:
+        pass
+    
     results = {
         'generator_output': network.generators_t.p,
         'node_prices': network.buses_t.marginal_price,
         'line_flows': network.lines_t.p0,
         'total_cost': network.objective,
         'load_balance': network.buses_t.p,
-        'storage_state': network.storage_units_t.state_of_charge if not network.storage_units_t.empty else None
+        'storage_state': storage_state,
+        're_curtailment': re_curtailment  # 재생에너지 Curtailment 추가
     }
+    
+    # Curtailment 요약 출력
+    if re_curtailment:
+        print("\n=== 재생에너지 Curtailment 요약 ===")
+        total_curtailment = sum(data['total_MWh'] for data in re_curtailment.values())
+        total_potential = sum(data['potential_MWh'] for data in re_curtailment.values())
+        print(f"총 Curtailment: {total_curtailment:.1f} MWh ({total_curtailment/1e6:.3f} TWh)")
+        print(f"총 잠재 발전: {total_potential:.1f} MWh ({total_potential/1e6:.3f} TWh)")
+        print(f"전체 Curtailment 비율: {(total_curtailment/total_potential*100):.2f}%")
+        
+        print("\n지역별/기술별 상위 5개:")
+        sorted_curtailment = sorted(re_curtailment.items(), 
+                                   key=lambda x: x[1]['total_MWh'], 
+                                   reverse=True)[:5]
+        for gen, data in sorted_curtailment:
+            print(f"  {gen}: {data['total_MWh']:.1f} MWh ({data['curtailment_rate_%']:.1f}%)")
     
     return results
 
@@ -1633,23 +2025,31 @@ def _classify_technology(gen_or_link_name):
         return '수력'
     if 'coal' in name:
         return '석탄'
+    if 'chp' in name:
+        return 'CHP'
     if 'lng' in name or 'gas' in name:
         return 'LNG'
+    if 'slack' in name or 'fallback' in name:
+        # 슬랙/폴백 발전기는 연결 버스 타입에 따라 분류
+        if '_h_' in name or 'heat' in name:
+            return '열'
+        elif '_h2_' in name or 'hydrogen' in name:
+            return '수소'
+        else:
+            return 'LNG'  # 전력 슬랙은 LNG 기반
     if 'oil' in name or 'diesel' in name:
         return '석유'
     if 'biomass' in name or 'bio' in name:
         return '바이오'
     if 'geothermal' in name:
         return '지열'
-    if 'chp' in name:
-        return 'CHP'
     if 'heatpump' in name or 'heat_pump' in name or name.startswith('hp') or ' hp ' in name:
         return '히트펌프'
     if 'electrolyser' in name or 'electrolyzer' in name or 'electrolysis' in name:
         return '전해조'
     if 'h2' in name or 'hydrogen' in name:
         return '수소'
-    if '_h_fallback_gen' in name or 'heat' in name:
+    if 'heat' in name:
         return '열'
     return '기타'
 
@@ -1669,8 +2069,18 @@ def build_final_energy_supply_tables(network):
     rows_total = []
     rows_region = []
     bus_to_carrier = network.buses.carrier.to_dict() if not network.buses.empty else {}
+    
+    # PyPSA statistics로 배출계수 가져오기
+    emission_factors = {}
+    for carrier in network.carriers.index:
+        emission_factors[carrier] = network.carriers.loc[carrier, 'co2_emissions']
+    
     if not network.generators.empty and not network.generators_t.p.empty:
         for gen in network.generators.index:
+            # Fuel_Supply 발전기는 중간 연료 공급이므로 최종 에너지 집계에서 제외
+            if 'fuel_supply' in gen.lower():
+                continue
+            
             bus = network.generators.at[gen, 'bus']
             final_energy = _map_final_energy_from_carrier(bus_to_carrier.get(bus, ''))
             if final_energy is None:
@@ -1680,9 +2090,15 @@ def build_final_energy_supply_tables(network):
             val = float(_np.nansum(series.values))
             if val <= 0:
                 continue
-            rows_total.append([final_energy, tech, val])
+            
+            # 배출량 계산 (PyPSA 내부 방식)
+            gen_carrier = network.generators.at[gen, 'carrier']
+            emission_factor = emission_factors.get(gen_carrier, 0.0)
+            emissions = val * emission_factor
+            
+            rows_total.append([final_energy, tech, val, emissions])
             region = gen.split('_')[0] if '_' in gen else ''
-            rows_region.append([region, final_energy, tech, val])
+            rows_region.append([region, final_energy, tech, val, emissions])
     def _add_link_port_supply(port_idx):
         p_attr = f"p{port_idx}"
         if not hasattr(network.links_t, p_attr):
@@ -1708,17 +2124,50 @@ def build_final_energy_supply_tables(network):
             if val <= 0:
                 continue
             tech = _classify_technology(link)
-            rows_total.append([final_energy, tech, val])
+            
+            # 링크 배출량 계산 (CHP 등)
+            emissions = 0.0
+            if 'chp' in link.lower():
+                # CHP의 경우: 연료 소비량(p0) 기반으로 배출량 계산 후 효율 비율로 분배
+                if hasattr(network.links_t, 'p0') and link in network.links_t.p0.columns:
+                    fuel_consumption = float(_np.nansum(network.links_t.p0[link].abs().values))  # 연료 소비량
+                    total_emissions = fuel_consumption * emission_factors.get('gas', 0.38)  # 총 배출량
+                    
+                    # 효율 정보 가져오기
+                    try:
+                        eff1 = float(network.links.at[link, 'efficiency']) if 'efficiency' in network.links.columns else 0.5
+                        eff2 = float(network.links.at[link, 'efficiency2']) if 'efficiency2' in network.links.columns else 0.4
+                        total_eff = eff1 + eff2
+                        
+                        # 현재 포트에 해당하는 효율 비율로 배출량 분배
+                        if port_idx == 1:
+                            emissions = total_emissions * (eff1 / total_eff) if total_eff > 0 else 0
+                        elif port_idx == 2:
+                            emissions = total_emissions * (eff2 / total_eff) if total_eff > 0 else 0
+                        else:
+                            emissions = 0  # port 3 이상은 배출량 0
+                    except:
+                        # 효율 정보가 없으면 전력:열 = 50:50으로 분배
+                        emissions = total_emissions * 0.5 if port_idx in [1, 2] else 0
+            else:
+                # 일반 링크는 출력 기반 배출량 (carrier 확인)
+                try:
+                    link_carrier = network.links.at[link, 'carrier'] if 'carrier' in network.links.columns else 'electricity'
+                    emissions = val * emission_factors.get(link_carrier, 0.0)
+                except:
+                    emissions = 0.0
+            
+            rows_total.append([final_energy, tech, val, emissions])
             region = str(dest_bus).split('_')[0] if '_' in str(dest_bus) else ''
-            rows_region.append([region, final_energy, tech, val])
+            rows_region.append([region, final_energy, tech, val, emissions])
     for k in [1, 2, 3]:
         _add_link_port_supply(k)
-    total_df = _pd.DataFrame(rows_total, columns=['final_energy', 'technology', 'supply_MWh'])
+    total_df = _pd.DataFrame(rows_total, columns=['final_energy', 'technology', 'supply_MWh', 'emissions_tCO2'])
     if not total_df.empty:
-        total_df = total_df.groupby(['final_energy', 'technology'], as_index=False)['supply_MWh'].sum()
-    by_region_df = _pd.DataFrame(rows_region, columns=['region', 'final_energy', 'technology', 'supply_MWh'])
+        total_df = total_df.groupby(['final_energy', 'technology'], as_index=False)[['supply_MWh', 'emissions_tCO2']].sum()
+    by_region_df = _pd.DataFrame(rows_region, columns=['region', 'final_energy', 'technology', 'supply_MWh', 'emissions_tCO2'])
     if not by_region_df.empty:
-        by_region_df = by_region_df.groupby(['region', 'final_energy', 'technology'], as_index=False)['supply_MWh'].sum()
+        by_region_df = by_region_df.groupby(['region', 'final_energy', 'technology'], as_index=False)[['supply_MWh', 'emissions_tCO2']].sum()
     return total_df, by_region_df
 
 # 국가 기준 시간별 수급표(전력/열/수소) 생성
@@ -1847,6 +2296,12 @@ def _build_country_timeseries_tables(network):
 def save_results(network, filename=None, subdir=None):
     """최적화 결과를 Excel 파일로 저장"""
     try:
+        # Curtailment 분석 및 출력 (저장 전에 먼저 실행)
+        print("\n" + "="*80)
+        print("재생에너지 Curtailment 분석 중...")
+        results = extract_results(network)
+        print("="*80 + "\n")
+        
         has_objective = hasattr(network, 'objective') and (network.objective is not None)
         if not has_objective:
             print("경고: 최적화 목적함수가 없지만, 중간 결과와 시계열을 저장합니다.")
@@ -1993,6 +2448,38 @@ def save_results(network, filename=None, subdir=None):
                 ts_el.to_excel(writer, sheet_name='TS_Electricity_National')
                 ts_h.to_excel(writer, sheet_name='TS_Heat_National')
                 ts_h2.to_excel(writer, sheet_name='TS_Hydrogen_National')
+                
+                # 8) Curtailment 상세 정보 저장
+                if 're_curtailment' in results and results['re_curtailment']:
+                    try:
+                        # Curtailment 요약
+                        curtailment_summary = []
+                        for gen, data in results['re_curtailment'].items():
+                            curtailment_summary.append({
+                                '발전기': gen,
+                                '지역': gen.split('_')[0] if '_' in gen else gen,
+                                '기술': 'PV' if 'PV' in gen.upper() else ('WT' if 'WT' in gen.upper() or 'WIND' in gen.upper() else '기타'),
+                                '잠재_발전량_MWh': data['potential_MWh'],
+                                '실제_발전량_MWh': data['actual_MWh'],
+                                'Curtailment_MWh': data['total_MWh'],
+                                'Curtailment_비율_%': data['curtailment_rate_%']
+                            })
+                        curtailment_summary_df = pd.DataFrame(curtailment_summary)
+                        curtailment_summary_df = curtailment_summary_df.sort_values('Curtailment_MWh', ascending=False)
+                        curtailment_summary_df.to_excel(writer, sheet_name='RE_Curtailment_Summary', index=False)
+                        
+                        # Curtailment 시계열 (상위 10개 발전기)
+                        top_generators = curtailment_summary_df.head(10)['발전기'].tolist()
+                        curtailment_timeseries = pd.DataFrame(index=network.snapshots)
+                        for gen in top_generators:
+                            if gen in results['re_curtailment']:
+                                curtailment_timeseries[gen] = results['re_curtailment'][gen]['timeseries']
+                        if not curtailment_timeseries.empty:
+                            curtailment_timeseries.to_excel(writer, sheet_name='RE_Curtailment_Timeseries')
+                        
+                        print(f"Curtailment 데이터 저장 완료: {len(curtailment_summary)}개 발전기")
+                    except Exception as e_curt:
+                        print(f"Curtailment 저장 경고: {e_curt}")
             except Exception as _e_ts:
                 print(f"국가 시간별 수급표 저장 경고: {_e_ts}")
                 try:
@@ -2329,6 +2816,12 @@ def create_visualizations(network, results_dir, current_time):
         except Exception as e:
             print(f"이전 버전 한국 지도 시각화 생성 중 오류: {str(e)}")
         
+        # 6. RE 전용 한국 지도 시각화 추가
+        try:
+            create_re_korea_map(network, results_dir, current_time)
+        except Exception as e:
+            print(f"RE 전용 한국 지도 시각화 생성 중 오류: {str(e)}")
+        
         print("시각화 결과 생성 완료:")
         print("- 지역별 에너지 밸런스 차트")
         print("- 지역별 재생에너지 비율 차트")
@@ -2336,6 +2829,7 @@ def create_visualizations(network, results_dir, current_time):
         print("- 인터랙티브 송전선로 지도")
         print("- 한국 지도 기반 송전선로 시각화")
         print("- 이전 버전 한국 지도 시각화")
+        print("- RE 전용 한국 지도 시각화 (신규)")
         
         return True
         
@@ -2756,6 +3250,279 @@ def create_legacy_korea_map(network, results_dir, current_time):
         
     except Exception as e:
         print(f"이전 버전 한국 지도 시각화 생성 중 오류: {str(e)}")
+        traceback.print_exc()
+        return False
+
+def create_re_korea_map(network, results_dir, current_time):
+    """RE 전용 한국 지도 시각화 (지역별 RE 발전/소비/송전)"""
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        print("RE 전용 한국 지도 시각화 생성 중...")
+        
+        # 한국 지역 좌표 정의
+        region_coords = {
+            'SEL': (5, 7), 'ICN': (4, 7), 'GGD': (5, 6), 'GWD': (7, 8),
+            'CBD': (6, 5), 'CND': (4, 5), 'DJN': (5, 4), 'SJG': (5, 4.5),
+            'JBD': (3, 3), 'JND': (2, 2), 'GWJ': (3, 2.5), 'GBD': (7, 4),
+            'DGU': (7, 3), 'GND': (6, 2), 'BSN': (7, 1), 'USN': (7.5, 1.5),
+            'JJD': (1, 0)
+        }
+        
+        # 1. 지역별 RE 발전량 및 전력 수요 계산
+        regional_re_gen = {}  # 지역별 RE 발전량
+        regional_re_by_tech = {}  # 지역별 기술별 RE 발전량
+        regional_demand = {}  # 지역별 전력 수요
+        
+        gen_output = network.generators_t.p
+        load_output = network.loads_t.p if hasattr(network.loads_t, 'p') and not network.loads_t.p.empty else network.loads_t.p_set
+        
+        # RE 발전량 집계 (RE 버스에 연결된 발전기)
+        for gen_name in gen_output.columns:
+            if '_' not in gen_name:
+                continue
+            
+            # RE 발전기만 (PV, WT, Solar, Wind)
+            is_re = any(keyword in gen_name for keyword in ['PV', 'WT', 'Solar', 'Wind', '_RE'])
+            gen_bus = network.generators.at[gen_name, 'bus'] if gen_name in network.generators.index else ''
+            is_re_bus = '_RE' in str(gen_bus)
+            
+            if not (is_re or is_re_bus):
+                continue
+            
+            region = gen_name.split('_')[0]
+            gen_sum = gen_output[gen_name].sum()
+            
+            # 총 RE 발전량
+            if region not in regional_re_gen:
+                regional_re_gen[region] = 0
+                regional_re_by_tech[region] = {'PV': 0, 'WT': 0, '기타': 0}
+            regional_re_gen[region] += gen_sum
+            
+            # 기술별 분류
+            if 'PV' in gen_name or 'Solar' in gen_name:
+                regional_re_by_tech[region]['PV'] += gen_sum
+            elif 'WT' in gen_name or 'Wind' in gen_name:
+                regional_re_by_tech[region]['WT'] += gen_sum
+            else:
+                regional_re_by_tech[region]['기타'] += gen_sum
+        
+        # 전력 수요 집계 (EL 버스 부하만)
+        for load_name in load_output.columns:
+            if '_' not in load_name or '_EL' not in load_name:
+                continue
+            region = load_name.split('_')[0]
+            load_sum = load_output[load_name].sum()
+            if region not in regional_demand:
+                regional_demand[region] = 0
+            regional_demand[region] += load_sum
+        
+        # 2. RE 송전선 조류 계산
+        re_line_flows = {}
+        
+        # Lines 데이터에서 RE 송전선 확인
+        if not network.lines.empty and hasattr(network.lines_t, 'p0') and not network.lines_t.p0.empty:
+            line_flows = network.lines_t.p0.mean()
+            for line_name in line_flows.index:
+                if line_name not in network.lines.index:
+                    continue
+                # RE 송전선만 (_RE 버스 간 연결)
+                bus0 = network.lines.at[line_name, 'bus0']
+                bus1 = network.lines.at[line_name, 'bus1']
+                if '_RE' in str(bus0) and '_RE' in str(bus1):
+                    flow = abs(line_flows[line_name])
+                    capacity = network.lines.at[line_name, 's_nom']
+                    utilization = flow / capacity * 100 if capacity > 0 else 0
+                    re_line_flows[line_name] = {
+                        'bus0': bus0,
+                        'bus1': bus1,
+                        'flow': flow,
+                        'capacity': capacity,
+                        'utilization': utilization
+                    }
+        
+        # Links 데이터에서도 RE 송전선 확인 (Lines에 없을 경우)
+        if not network.links.empty and hasattr(network.links_t, 'p0') and not network.links_t.p0.empty:
+            link_flows = network.links_t.p0.mean()
+            for link_name in link_flows.index:
+                if link_name not in network.links.index:
+                    continue
+                # RE 송전선만 (_RE 버스 간 연결)
+                bus0 = network.links.at[link_name, 'bus0']
+                bus1 = network.links.at[link_name, 'bus1']
+                if '_RE' in str(bus0) and '_RE' in str(bus1):
+                    flow = abs(link_flows[link_name])
+                    # Links는 p_nom 사용
+                    capacity = network.links.at[link_name, 'p_nom'] if 'p_nom' in network.links.columns else 1e-6
+                    utilization = flow / capacity * 100 if capacity > 0 else 0
+                    re_line_flows[link_name] = {
+                        'bus0': bus0,
+                        'bus1': bus1,
+                        'flow': flow,
+                        'capacity': capacity,
+                        'utilization': utilization
+                    }
+        
+        print(f"RE 송전선 발견: {len(re_line_flows)}개")
+        if re_line_flows:
+            print("RE 송전선 목록:")
+            for line_name, data in list(re_line_flows.items())[:5]:  # 처음 5개만 출력
+                print(f"  - {line_name}: {data['bus0']} → {data['bus1']}, 흐름: {data['flow']:.1f}MW, 이용률: {data['utilization']:.1f}%")
+        
+        # 3. 지도 생성
+        fig, ax = plt.subplots(figsize=(20, 10))
+        ax.set_xlim(0, 9)
+        ax.set_ylim(-1, 9)
+        ax.set_aspect('equal')
+        
+        # 4. RE 송전선 그리기
+        for line_name, line_data in re_line_flows.items():
+            bus0 = line_data['bus0']
+            bus1 = line_data['bus1']
+            
+            region0 = bus0.split('_')[0] if '_' in bus0 else bus0
+            region1 = bus1.split('_')[0] if '_' in bus1 else bus1
+            
+            if region0 not in region_coords or region1 not in region_coords:
+                continue
+            
+            x0, y0 = region_coords[region0]
+            x1, y1 = region_coords[region1]
+            
+            flow = line_data['flow']
+            utilization = line_data['utilization']
+            
+            # 이용률에 따른 색상
+            if utilization > 80:
+                color = 'red'
+            elif utilization > 60:
+                color = 'orange'
+            elif utilization > 40:
+                color = 'yellow'
+            elif utilization > 20:
+                color = 'lightgreen'
+            else:
+                color = 'green'
+            
+            # 흐름량에 따른 선 두께 (정규화)
+            max_flow = max([lf['flow'] for lf in re_line_flows.values()]) if re_line_flows else 1e-6
+            width = max(0.5, (flow / max_flow) * 5 + 0.5)
+            
+            # RE 송전선 그리기
+            ax.plot([x0, x1], [y0, y1], color=color, linewidth=width, alpha=0.7, linestyle='--')
+            
+            # 유량 표시 (큰 흐름만)
+            if flow > max_flow * 0.3:
+                mid_x, mid_y = (x0 + x1) / 2, (y0 + y1) / 2
+                ax.text(mid_x, mid_y, f'{flow/1000:.0f}GW', 
+                       fontsize=6, ha='center', va='center',
+                       bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
+        
+        # 5. 지역별 RE 발전/수요 원 그리기
+        max_demand = max(regional_demand.values()) if regional_demand else 1e-6
+        
+        for region, coords in region_coords.items():
+            x, y = coords
+            re_generation = regional_re_gen.get(region, 0)
+            demand = regional_demand.get(region, 0)
+            re_tech = regional_re_by_tech.get(region, {'PV': 0, 'WT': 0, '기타': 0})
+            
+            # 수요 기준 원 크기 (2/3 크기로 축소)
+            size = max(50, (demand / max_demand) * 1000 * (2/3)) if max_demand > 0 else 50
+            
+            # RE 자급률 계산 (지역 내 RE 발전 / 지역 수요)
+            re_self_sufficiency = (re_generation / demand * 100) if demand > 0 else 0
+            
+            # RE 자급률에 따른 색상 (빨강 → 노랑 → 녹색)
+            if re_self_sufficiency >= 80:
+                color = plt.cm.RdYlGn(0.9)  # 진한 녹색
+            elif re_self_sufficiency >= 50:
+                color = plt.cm.RdYlGn(0.7)  # 연한 녹색
+            elif re_self_sufficiency >= 30:
+                color = plt.cm.RdYlGn(0.5)  # 노랑
+            elif re_self_sufficiency >= 10:
+                color = plt.cm.RdYlGn(0.3)  # 주황
+            else:
+                color = plt.cm.RdYlGn(0.1)  # 빨강
+            
+            # 지역 원 그리기
+            circle = plt.Circle((x, y), np.sqrt(size)/20, color=color, alpha=0.8, edgecolor='black', linewidth=2)
+            ax.add_patch(circle)
+            
+            # 지역명
+            ax.text(x, y+0.15, region, ha='center', va='center', fontsize=10, fontweight='bold', color='white')
+            
+            # 지역 정보 텍스트 (간소화: 수요, PV, WT만 표시)
+            info_lines = []
+            info_lines.append(f"수요: {demand/1e6:.1f}TWh")
+            if re_tech['PV'] > 0:
+                info_lines.append(f"PV: {re_tech['PV']/1e6:.1f}TWh")
+            if re_tech['WT'] > 0:
+                info_lines.append(f"WT: {re_tech['WT']/1e6:.1f}TWh")
+            
+            info_text = '\n'.join(info_lines)
+            ax.text(x, y-0.5, info_text, ha='center', va='top', fontsize=6,
+                   bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray', pad=2))
+        
+        ax.set_title('지역별 재생에너지 발전 및 송전 현황', fontsize=16, fontweight='bold', pad=20)
+        ax.set_xlabel('원 색상: RE 자급률 (빨강:낮음 → 녹색:높음) | 선 색상: 송전선 이용률 | 선 두께: RE 흐름량', fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        
+        # 범례 추가
+        legend_elements = [
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=plt.cm.RdYlGn(0.9), 
+                      markersize=12, label='RE 자급률 ≥80%'),
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=plt.cm.RdYlGn(0.5), 
+                      markersize=12, label='RE 자급률 30-80%'),
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=plt.cm.RdYlGn(0.1), 
+                      markersize=12, label='RE 자급률 <30%'),
+            plt.Line2D([0], [0], color='green', lw=2, linestyle='--', label='RE 송전 이용률 <40%'),
+            plt.Line2D([0], [0], color='orange', lw=2, linestyle='--', label='RE 송전 이용률 40-80%'),
+            plt.Line2D([0], [0], color='red', lw=2, linestyle='--', label='RE 송전 이용률 >80%')
+        ]
+        ax.legend(handles=legend_elements, loc='upper left', fontsize=8)
+        
+        plt.tight_layout()
+        
+        # 파일 저장
+        re_map_path = f'{results_dir}/re_korea_map_{current_time}.png'
+        plt.savefig(re_map_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
+        
+        print(f"RE 전용 한국 지도 시각화가 '{re_map_path}'에 저장되었습니다.")
+        
+        # 상세 정보 CSV 저장
+        re_data = []
+        for region in region_coords.keys():
+            re_gen = regional_re_gen.get(region, 0)
+            demand = regional_demand.get(region, 0)
+            re_tech = regional_re_by_tech.get(region, {'PV': 0, 'WT': 0, '기타': 0})
+            re_self_sufficiency = (re_gen / demand * 100) if demand > 0 else 0
+            
+            re_data.append([
+                region, 
+                demand/1e6, 
+                re_gen/1e6, 
+                re_tech['PV']/1e6, 
+                re_tech['WT']/1e6, 
+                re_tech['기타']/1e6,
+                re_self_sufficiency
+            ])
+        
+        re_df = pd.DataFrame(re_data, columns=[
+            '지역', '전력수요(TWh)', 'RE발전(TWh)', 'PV(TWh)', 'WT(TWh)', '기타RE(TWh)', 'RE자급률(%)'
+        ])
+        re_df.to_csv(f'{results_dir}/re_korea_summary_{current_time}.csv', 
+                    index=False, encoding='utf-8-sig')
+        
+        return True
+        
+    except Exception as e:
+        print(f"RE 전용 한국 지도 시각화 생성 중 오류: {str(e)}")
+        import traceback
         traceback.print_exc()
         return False
 
@@ -3563,6 +4330,8 @@ def _standardize_bus_token_by_carrier(carrier):
         return 'H2'
     if 'gas' in c or 'lng' in c or c == '가스':
         return 'LNG'
+    if 'ev' in c or c == '전기차':
+        return 'EV'
     return None
 
 
