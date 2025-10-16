@@ -510,7 +510,8 @@ def create_network(input_data):
             'solar': {'name': 'solar', 'co2_emissions': 0},
             'wind': {'name': 'wind', 'co2_emissions': 0},
             'hydrogen': {'name': 'hydrogen', 'co2_emissions': 0},
-            'heat': {'name': 'heat', 'co2_emissions': 0}
+            'heat': {'name': 'heat', 'co2_emissions': 0},
+            'EV': {'name': 'EV', 'co2_emissions': 0}  # 전기차 배터리 carrier
         }
         
         # carriers 추가
@@ -655,10 +656,11 @@ def create_network(input_data):
                     print(f"  [수정] {gen_name}: carrier 수정 {gen['carrier']} → {correct_carrier}")
                 
                 # 나머지 파라미터 추가
-                optional_params = ['p_nom_extendable', 'marginal_cost', 'capital_cost', 'efficiency', 'p_min_pu', 'p_nom_min', 'p_nom_max']
+                optional_params = ['p_nom_extendable', 'marginal_cost', 'capital_cost', 'efficiency', 'p_min_pu', 'p_nom_min', 'p_nom_max', 
+                                   'ramp_limit_up', 'ramp_limit_down', 'committable', 'min_up_time', 'min_down_time', 'start_up_cost', 'shut_down_cost']
                 for param in optional_params:
                     if param in gen and pd.notna(gen[param]):
-                        if param == 'p_nom_extendable':
+                        if param in ['p_nom_extendable', 'committable']:
                             params[param] = _to_bool(gen[param])
                         else:
                             params[param] = float(gen[param])
@@ -737,7 +739,8 @@ def create_network(input_data):
                 else:
                     print(f"[경고] {gen_name}: 패턴 적용되지 않음 - 기본값 1.0 사용")
         
-        # 발전기 효율 및 최대/최소 출력비율(p_max_pu/p_min_pu) 반영
+        # 발전기 최대/최소 출력비율(p_max_pu/p_min_pu) 반영
+        # 주의: efficiency는 p_max_pu에 곱하지 않음 (발전량 제한이 아닌 연료소비량 계산에만 사용)
         # [경고] 재생에너지(PV, WT)는 패턴이 이미 적용되었으므로 추가 처리 제외
         try:
             gdf = input_data.get('generators', pd.DataFrame())
@@ -748,46 +751,33 @@ def create_network(input_data):
                     if not gname or gname not in network.generators.index:
                         continue
                     
-                    # 재생에너지 발전기는 이미 패턴이 적용되었으므로 효율 곱셈 건너뜀
+                    # 재생에너지 발전기는 이미 패턴이 적용되었으므로 건너뜀
                     is_renewable = any(keyword in gname.lower() for keyword in ['pv', 'solar', 'wind', 'wt'])
                     if is_renewable:
-                        print(f"재생에너지 {gname}: 패턴 유지, 효율 적용 건너뜀")
                         continue
                     
-                    # 효율
-                    eff = pd.to_numeric(row.get('efficiency'), errors='coerce')
-                    if pd.isna(eff) and '효율' in cols:
-                        eff = pd.to_numeric(row.get('효율'), errors='coerce')
-                    # 최대/최소 출력비율
+                    # 최대/최소 출력비율 (효율은 제외!)
                     max_ratio = pd.to_numeric(row.get('p_max_pu'), errors='coerce')
                     if pd.isna(max_ratio) and '최대출력비율' in cols:
                         max_ratio = pd.to_numeric(row.get('최대출력비율'), errors='coerce')
                     min_ratio = pd.to_numeric(row.get('p_min_pu'), errors='coerce')
                     if pd.isna(min_ratio) and '최소출력비율' in cols:
                         min_ratio = pd.to_numeric(row.get('최소출력비율'), errors='coerce')
-                    # 상한 배율 = (기본 1.0) × max_ratio × eff(0~1)
-                    cap_mul = 1.0
+                    
+                    # p_max_pu 적용 (효율 곱하지 않음!)
                     if pd.notna(max_ratio):
                         cap_mul = float(np.clip(max_ratio, 0.0, 1.0))
-                    if pd.notna(eff) and 0.0 < float(eff) <= 1.0:
-                        cap_mul *= float(eff)
-                    # p_max_pu 적용(이미 패턴이 있으면 곱)
-                    if gname in network.generators_t.p_max_pu.columns:
-                        network.generators_t.p_max_pu[gname] = network.generators_t.p_max_pu[gname] * cap_mul
-                    else:
-                        network.generators_t.p_max_pu[gname] = pd.Series(cap_mul, index=network.snapshots)
+                        if gname in network.generators_t.p_max_pu.columns:
+                            network.generators_t.p_max_pu[gname] = network.generators_t.p_max_pu[gname] * cap_mul
+                        else:
+                            network.generators_t.p_max_pu[gname] = pd.Series(cap_mul, index=network.snapshots)
+                        print(f"발전기 출력제한 적용: {gname} (p_max_pu={cap_mul:.3f})")
+                    
                     # p_min_pu 적용(있을 때만)
                     if pd.notna(min_ratio):
                         min_val = float(np.clip(min_ratio, 0.0, 1.0))
                         network.generators_t.p_min_pu[gname] = pd.Series(min_val, index=network.snapshots)
-                    try:
-                        msg = f"발전기 출력제한 적용: {gname} (max×eff={cap_mul:.3f}"
-                        if pd.notna(min_ratio):
-                            msg += f", min={float(np.clip(min_ratio, 0.0, 1.0)):.3f}"
-                        msg += ")"
-                        print(msg)
-                    except Exception:
-                        pass
+                        print(f"발전기 최소출력 설정: {gname} (p_min_pu={min_val:.3f})")
             # p_min_pu <= p_max_pu 보정 (재생에너지 제외)
             try:
                 for gname in network.generators.index:
@@ -1009,8 +999,15 @@ def create_network(input_data):
                         pattern = _get_load_pattern(input_data, region, dtype, len(snapshots)) if region else None
                         if pattern is not None:
                             # 총수요 × 8760 × 패턴(스케일 없이 그대로 적용)
-                            p_set = float(p_set) * 8760.0 * pattern
+                            p_set_original = float(p_set)
+                            p_set = p_set_original * 8760.0 * pattern
                             print(f"부하 {name}에 패턴 적용됨 (총수요×8760×패턴, 타입={dtype})")
+                            
+                            # EV 부하인 경우 상세 로그
+                            if dtype == 'EV_DRIVING':
+                                print(f"  [EV 주행] 원본 수요: {p_set_original:.2f} MW")
+                                print(f"  [EV 주행] 패턴 통계: 최소={np.min(pattern):.6f}, 최대={np.max(pattern):.6f}, 평균={np.mean(pattern):.6f}, 합={np.sum(pattern):.2f}")
+                                print(f"  [EV 주행] 적용 후 시간별 수요: 최소={np.min(p_set):.2f}, 최대={np.max(p_set):.2f}, 평균={np.mean(p_set):.2f} MW")
                         else:
                             cols = list(input_data['load_patterns'].columns) if 'load_patterns' in input_data else []
                             print(f"부하 {name}: 패턴 미발견 (region={region}, type={dtype}), 사용 가능 컬럼: {cols[:10]}{'...' if len(cols)>10 else ''}")
@@ -1316,26 +1313,46 @@ def create_network(input_data):
                 else:
                     print(f"Link {link_name} 건너뜀: 유효하지 않은 버스 연결 (bus0: {bus0_name}, bus1: {bus1_name})")
             
-            # # EV 충전 패턴 적용 (Links 추가 완료 후) [임시 비활성화 - unknown 에러 해결 필요]
+            # # EV 충전 패턴 적용 (Links 추가 완료 후) [격리 테스트를 위해 임시 비활성화]
             # print("\n=== EV 충전 패턴 적용 시작 ===")
             # if 'load_patterns' in input_data:
             #     ev_charging_pattern = _get_load_pattern(input_data, None, 'EV_CHARGING', len(snapshots))
             #     if ev_charging_pattern is not None:
+            #         # 방어적 코딩: 0 값을 최소값으로 치환 (혹시나 모를 문제 방지)
+            #         min_charging_rate = 0.01  # 최소 1% 충전 보장
+            #         ev_charging_pattern = np.maximum(ev_charging_pattern, min_charging_rate)
+            #         
             #         ev_charger_count = 0
             #         for link_name in network.links.index:
             #             # EV_Charger 링크 감지 (이름에 'EV_Charger', 'EV_charger', 'ev_charger' 포함)
             #             if 'ev' in link_name.lower() and 'charg' in link_name.lower():
             #                 # p_max_pu에 충전 가능 패턴 적용
             #                 network.links_t.p_max_pu[link_name] = ev_charging_pattern
-            #                 print(f"Link {link_name}에 EV 충전 패턴 적용됨 (p_max_pu)")
+            #                 print(f"Link {link_name}에 EV 충전 패턴 적용됨 (p_max_pu, 최소 {min_charging_rate*100:.0f}% 보장)")
             #                 ev_charger_count += 1
             #         
             #         if ev_charger_count > 0:
             #             print(f"총 {ev_charger_count}개 EV Charger 링크에 충전 패턴 적용 완료")
             #             # 패턴 샘플 출력
-            #             sample_n = min(8, len(ev_charging_pattern))
-            #             print(f"EV 충전 패턴 샘플 (0~{sample_n-1}시): {np.round(ev_charging_pattern[:sample_n], 4).tolist()}")
-            #             print(f"EV 충전 패턴 통계: 최소={np.min(ev_charging_pattern):.4f}, 최대={np.max(ev_charging_pattern):.4f}, 평균={np.mean(ev_charging_pattern):.4f}")
+            #             sample_n = min(24, len(ev_charging_pattern))
+            #             print(f"\nEV 충전 패턴 상세 (첫 24시간):")
+            #             print(f"  {np.round(ev_charging_pattern[:sample_n], 4).tolist()}")
+            #             print(f"\nEV 충전 패턴 통계:")
+            #             print(f"  최소: {np.min(ev_charging_pattern):.6f}")
+            #             print(f"  최대: {np.max(ev_charging_pattern):.6f}")
+            #             print(f"  평균: {np.mean(ev_charging_pattern):.6f}")
+            #             print(f"  합계: {np.sum(ev_charging_pattern):.6f} (정규화 여부 확인: 1.0이면 문제!)")
+            #             print(f"  0.1 미만 개수: {np.sum(ev_charging_pattern < 0.1)} / {len(ev_charging_pattern)}")
+            #             
+            #             # EV Charger p_nom 확인
+            #             charger_pnom = network.links.loc[network.links.index.str.contains('EV_Charger', case=False, na=False), 'p_nom']
+            #             if not charger_pnom.empty:
+            #                 print(f"\nEV Charger 용량 (p_nom):")
+            #                 print(f"  평균: {charger_pnom.mean():.2f} MW")
+            #                 print(f"  최소: {charger_pnom.min():.2f} MW")
+            #                 print(f"  최대: {charger_pnom.max():.2f} MW")
+            #                 print(f"  예상 최소 충전 가능: {charger_pnom.mean() * np.min(ev_charging_pattern):.2f} MW")
+            #                 print(f"  예상 최대 충전 가능: {charger_pnom.mean() * np.max(ev_charging_pattern):.2f} MW")
             #         else:
             #             print("[경고] EV Charger 링크를 찾지 못했습니다.")
             #     else:
@@ -1396,6 +1413,24 @@ def create_network(input_data):
                     
                     network.add("Store", **params)
                     print(f"저장장치 {store_name} 추가됨 (버스: {bus_name})")
+                    
+                    # EV_DSM 특별 처리: 매일 오전 6시에 80% 충전 상태 요구 [1단계]
+                    if 'EV_DSM' in store_name:
+                        # 기본 e_min_pu 값 (Excel에서 읽었거나 기본값)
+                        base_e_min_pu = params.get('e_min_pu', 0.4)
+                        
+                        # 시간별 e_min_pu 생성
+                        e_min_pu_series = pd.Series(base_e_min_pu, index=snapshots)
+                        
+                        # 매일 오전 6시: 80% 충전 상태 요구
+                        morning_mask = e_min_pu_series.index.hour == 6
+                        e_min_pu_series[morning_mask] = 0.8
+                        
+                        # 시간별 e_min_pu 적용
+                        network.stores_t.e_min_pu[store_name] = e_min_pu_series
+                        
+                        morning_count = morning_mask.sum()
+                        print(f"  [EV_DSM 시간별 설정] 기본: {base_e_min_pu:.2f} ({base_e_min_pu*100:.0f}%), 오전 6시: 0.80 (80%) - {morning_count}개 시점")
                 else:
                     print(f"저장장치 {store_name} 건너뜀: 버스 '{bus_name}'가 존재하지 않음")
         
@@ -1691,7 +1726,7 @@ def create_network(input_data):
                 if (not has_gen) or ensure_slack:
                     slack_name = f"{bus}_Slack_Failsafe"
                     if slack_name not in network.generators.index:
-                        mcost = float(os.environ.get('SLACK_GEN_COST', '1e9'))
+                        mcost = float(os.environ.get('SLACK_GEN_COST', '10000'))
                         # 전력/열/수소 중 해당 캐리어로 무배출 초고비용 슬랙
                         carrier_val = bus_carrier if bus_carrier in ['electricity','heat','hydrogen'] else 'electricity'
                         network.add("Generator",
@@ -3629,14 +3664,17 @@ def check_excel_data_loading(input_data):
         print("\n실제 데이터:")
         print(links_df)
         
-        # 필수 컬럼 확인
+        # 필수 컬럼 확인 (efficiency0 사용)
         required_columns = [
-            'name', 'bus0', 'bus1', 'efficiency', 'p_nom', 
+            'name', 'bus0', 'bus1', 'p_nom', 
             'p_nom_extendable', 'p_nom_max'
         ]
         missing_columns = [col for col in required_columns if col not in links_df.columns]
         if missing_columns:
             print(f"\n누락된 필수 컬럼: {missing_columns}")
+        # efficiency 체크 (efficiency 또는 efficiency0 중 하나만 있으면 OK)
+        if 'efficiency' not in links_df.columns and 'efficiency0' not in links_df.columns:
+            print("\n[경고] 'efficiency' 또는 'efficiency0' 컬럼이 필요합니다.")
 
 def analyze_regional_results(network, results_dir, current_time):
     """지역별 분석 결과 생성"""
@@ -4126,27 +4164,40 @@ def _fallback_build_lines_from_interface(input_data, interface_path):
         cols_lower = {c: str(c).strip().lower() for c in df.columns}
 
         def find_col(cands):
+            # 1단계: 완전 일치 우선
             for c in df.columns:
                 cl = cols_lower[c]
                 for k in cands:
-                    if k == cl or k in cl:
+                    if k == cl:
+                        return c
+            # 2단계: 부분 문자열 매칭
+            for c in df.columns:
+                cl = cols_lower[c]
+                for k in cands:
+                    if k in cl:
                         return c
             return None
 
-        # 주요 컬럼 매핑(레이블 매칭 우선)
-        from_col = find_col(['from', '출발', '시작', '지역1', '출발지역', 'from_region', 'region1'])
-        to_col = find_col(['to', '도착', '끝', '지역2', '도착지역', 'to_region', 'region2'])
-        name_col = find_col(['name', '이름', '선로명'])
+        # 주요 컬럼 매핑 (PyPSA 표준 우선, 없으면 한글)
+        from_col = 'bus0' if 'bus0' in df.columns else find_col(['from', '출발', '시작', '지역1', '출발지역', 'from_region', 'region1'])
+        to_col = 'bus1' if 'bus1' in df.columns else find_col(['to', '도착', '끝', '지역2', '도착지역', 'to_region', 'region2'])
+        name_col = 'name' if 'name' in df.columns else find_col(['이름', '선로명'])
 
-        # 사용자가 통일한 레이블 매칭(type, length, x, r, num_parallel)
-        type_col = find_col(['type'])
-        length_col = find_col(['length'])
-        x_col = find_col(['x'])
-        r_col = find_col(['r'])
-        num_parallel_col = find_col(['num_parallel'])
-
-        # 용량은 기존 키워드로 탐색
-        cap_col = find_col(['s_nom', 'capacity', '용량', 'mva', '정격'])
+        # PyPSA 표준 컬럼명 직접 사용 (사용자가 interface.xlsx를 표준화함)
+        # 존재하는 컬럼만 사용
+        type_col = 'type' if 'type' in df.columns else None
+        length_col = 'length' if 'length' in df.columns else None
+        x_col = 'x' if 'x' in df.columns else None
+        r_col = 'r' if 'r' in df.columns else None
+        s_nom_col = 's_nom' if 's_nom' in df.columns else find_col(['capacity', '용량', 'mva', '정격'])
+        
+        # 디버깅: 사용할 컬럼 출력
+        print(f"컬럼 매칭 결과 (PyPSA 표준):")
+        print(f"  s_nom_col: {s_nom_col}")
+        print(f"  length_col: {length_col}")
+        print(f"  x_col: {x_col}")
+        print(f"  r_col: {r_col}")
+        print(f"  type_col: {type_col}")
 
         if from_col is None or to_col is None:
             print("'지역간 연결' 시트에서 출발/도착 컬럼을 찾지 못했습니다.")
@@ -4184,12 +4235,11 @@ def _fallback_build_lines_from_interface(input_data, interface_path):
             to_region = str(to_raw).strip()
 
             name_val = str(row.get(name_col)).strip() if (name_col and pd.notna(row.get(name_col))) else f"{fr_region}-{to_region}"
-            s_nom_val = float(pd.to_numeric(row.get(cap_col), errors='coerce')) if cap_col else 1000.0
-            x_val = float(pd.to_numeric(row.get(x_col), errors='coerce')) if x_col else 0.1
-            r_val = float(pd.to_numeric(row.get(r_col), errors='coerce')) if r_col else 0.01
-            length_val = float(pd.to_numeric(row.get(length_col), errors='coerce')) if length_col else np.nan
+            s_nom_val = float(pd.to_numeric(row.get(s_nom_col), errors='coerce')) if s_nom_col and pd.notna(row.get(s_nom_col)) else 1000.0
+            x_val = float(pd.to_numeric(row.get(x_col), errors='coerce')) if x_col and pd.notna(row.get(x_col)) else 0.1
+            r_val = float(pd.to_numeric(row.get(r_col), errors='coerce')) if r_col and pd.notna(row.get(r_col)) else 0.01
+            length_val = float(pd.to_numeric(row.get(length_col), errors='coerce')) if length_col and pd.notna(row.get(length_col)) else np.nan
             type_val = str(row.get(type_col)).strip() if (type_col and pd.notna(row.get(type_col))) else np.nan
-            num_parallel_val = int(pd.to_numeric(row.get(num_parallel_col), errors='coerce')) if num_parallel_col else np.nan
 
             bus0 = guess_bus(fr_region)
             bus1 = guess_bus(to_region)
@@ -4202,8 +4252,7 @@ def _fallback_build_lines_from_interface(input_data, interface_path):
                 'x': x_val,
                 'r': r_val,
                 'length': length_val,
-                'type': type_val,
-                'num_parallel': num_parallel_val
+                'type': type_val
             })
             added += 1
 

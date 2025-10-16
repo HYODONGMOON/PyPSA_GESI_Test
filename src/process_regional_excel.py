@@ -356,17 +356,17 @@ class RegionalExcelProcessor:
                 if not ws.cell(row=row, column=1).value:
                     continue
                 
-                # 연결 데이터 읽기
-                name = ws.cell(row=row, column=1).value
-                region1 = ws.cell(row=row, column=2).value
-                bus1 = ws.cell(row=row, column=3).value
-                region2 = ws.cell(row=row, column=4).value
-                bus2 = ws.cell(row=row, column=5).value
-                capacity = ws.cell(row=row, column=6).value
-                voltage = ws.cell(row=row, column=7).value
-                distance = ws.cell(row=row, column=8).value
-                x = ws.cell(row=row, column=9).value
-                r = ws.cell(row=row, column=10).value
+                # 연결 데이터 읽기 (interface.xlsx 구조: C=bus0, D=출발지역, E=bus1, F=s_nom, G=length, H=x, I=r)
+                name = ws.cell(row=row, column=1).value      # A열: name
+                region1 = ws.cell(row=row, column=2).value   # B열: 출발 지역
+                bus1 = ws.cell(row=row, column=3).value      # C열: bus0
+                region2 = ws.cell(row=row, column=4).value   # D열: 출발 지역 (실제로는 중복?)
+                bus2 = ws.cell(row=row, column=5).value      # E열: bus1
+                capacity = ws.cell(row=row, column=6).value  # F열: s_nom
+                distance = ws.cell(row=row, column=7).value  # G열: length
+                x = ws.cell(row=row, column=8).value         # H열: x
+                r = ws.cell(row=row, column=9).value         # I열: r
+                # voltage는 사용하지 않으므로 제거 (또는 다른 컬럼에서 읽기)
                 
                 # 필수 필드 확인
                 if not all([region1, region2, bus1, bus2]):
@@ -387,7 +387,7 @@ class RegionalExcelProcessor:
                     'bus1': bus2,
                     'carrier': 'AC',
                     's_nom': float(capacity) if capacity else 1000.0,
-                    'v_nom': float(voltage) if voltage else 345.0,
+                    'v_nom': 345.0,  # 기본값 사용 (interface.xlsx에 v_nom 컬럼이 없음)
                     'length': float(distance) if distance else None,
                     'x': float(x) if x else None,
                     'r': float(r) if r else None
