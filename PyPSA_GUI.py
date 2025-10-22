@@ -500,12 +500,15 @@ def create_network(input_data):
         network = pypsa.Network()
         
         # carriers 정의 (PyPSA 내부 배출계수 활용)
+        # 주의: PyPSA는 type="primary_energy"로 (전력량/efficiency) × co2_emissions 계산
+        # 배출계수는 전력량 기준이므로, carrier.co2_emissions = 전력량기준배출계수 × 대표efficiency
+        # 예: 석탄 0.8384 tCO2/MWh_electric × 0.47 efficiency = 0.39405 tCO2/MWh_fuel
         carriers = {
             'AC': {'name': 'AC', 'co2_emissions': 0},
             'DC': {'name': 'DC', 'co2_emissions': 0},
             'electricity': {'name': 'electricity', 'co2_emissions': 0},
-            'coal': {'name': 'coal', 'co2_emissions': 0.8384},  # 정확한 한국 석탄 배출계수
-            'gas': {'name': 'gas', 'co2_emissions': 0.38},      # 정확한 한국 LNG 배출계수
+            'coal': {'name': 'coal', 'co2_emissions': 0.8384 * 0.47},  # 석탄 전력량기준 × 평균효율0.47
+            'gas': {'name': 'gas', 'co2_emissions': 0.38 * 0.53},      # LNG 전력량기준 × 평균효율0.53
             'nuclear': {'name': 'nuclear', 'co2_emissions': 0},
             'solar': {'name': 'solar', 'co2_emissions': 0},
             'wind': {'name': 'wind', 'co2_emissions': 0},
@@ -560,48 +563,47 @@ def create_network(input_data):
                           carrier=carrier)
                 print(f"버스 추가됨: {bus_name} (carrier: {carrier}, v_nom: {v_nom_val})")
         
-        # 재생에너지 패턴 준비
+        # 재생에너지 패턴 준비 (지역별)
         renewable_patterns = {}
         if 'renewable_patterns' in input_data:
             patterns_df = input_data['renewable_patterns']
-            print(f"재생에너지 패턴 원본 데이터 확인:")
+            print(f"\n=== 재생에너지 패턴 로딩 (지역별) ===")
             print(f"컬럼: {patterns_df.columns.tolist()}")
-            print(f"첫 10행:")
-            print(patterns_df.head(10))
             
             # 실제 데이터가 있는 행 찾기 (4행부터 시작)
             if len(patterns_df) > 4:
-                # 헤더 행 찾기 (3행: 시간, 태양광(PV), 풍력(WT))
-                header_row = patterns_df.iloc[3]
-                print(f"헤더 행: {header_row.tolist()}")
+                # 헤더 행 찾기 (B5, C5, D5, ... 에 패턴 이름)
+                header_row = patterns_df.iloc[3]  # 5행 (0-based index 3은 4행)
+                print(f"헤더 행 (처음 5개): {header_row.tolist()[:5]}")
                 
-                # 데이터 행들 (4행부터)
+                # 데이터 행들 (5행부터, 0-based index 4부터)
                 data_rows = patterns_df.iloc[4:].copy()
                 
-                # 컬럼명 재설정
-                if len(header_row) >= 3:
-                    data_rows.columns = ['시간', 'PV', 'WT']
+                # 각 컬럼을 순회하며 패턴 로드
+                for col_idx, col_name in enumerate(patterns_df.columns):
+                    if col_idx == 0:  # 첫 번째 컬럼(시간)은 건너뛰기
+                        continue
                     
-                    # PV 패턴 처리
-                    if 'PV' in data_rows.columns:
-                        pv_values = pd.to_numeric(data_rows['PV'], errors='coerce').dropna().values
-                        if len(pv_values) > 0:
-                            pv_pattern = normalize_pattern(pv_values)
-                            pv_pattern = adjust_pattern_length(pv_pattern, snapshots_length)
-                            renewable_patterns['PV_pattern'] = pv_pattern
-                            print(f"PV 패턴 준비됨 - 길이: {len(pv_pattern)}, 최대값: {np.max(pv_pattern):.3f}, 최소값: {np.min(pv_pattern):.3f}")
+                    # 헤더에서 패턴 이름 가져오기
+                    pattern_name = str(header_row.iloc[col_idx]).strip()
                     
-                    # WT 패턴 처리
-                    if 'WT' in data_rows.columns:
-                        wt_values = pd.to_numeric(data_rows['WT'], errors='coerce').dropna().values
-                        if len(wt_values) > 0:
-                            wt_pattern = normalize_pattern(wt_values)
-                            wt_pattern = adjust_pattern_length(wt_pattern, snapshots_length)
-                            renewable_patterns['WT_pattern'] = wt_pattern
-                            print(f"WT 패턴 준비됨 - 길이: {len(wt_pattern)}, 최대값: {np.max(wt_pattern):.3f}, 최소값: {np.min(wt_pattern):.3f}")
+                    # 건너뛰기: 빈 값이거나 'Unnamed'인 경우
+                    if pd.isna(pattern_name) or 'Unnamed' in pattern_name or pattern_name == 'nan':
+                        continue
+                    
+                    # 패턴 데이터 추출
+                    pattern_values = pd.to_numeric(data_rows.iloc[:, col_idx], errors='coerce').dropna().values
+                    
+                    if len(pattern_values) > 0:
+                        pattern = normalize_pattern(pattern_values)
+                        pattern = adjust_pattern_length(pattern, snapshots_length)
+                        renewable_patterns[pattern_name] = pattern
+                        print(f"  [{pattern_name}] 로드 완료 - 길이: {len(pattern)}, 최대: {np.max(pattern):.3f}, 최소: {np.min(pattern):.3f}")
             
             if not renewable_patterns:
                 print("[경고] 재생에너지 패턴을 찾을 수 없습니다. 기본값 1.0을 사용합니다.")
+            else:
+                print(f"[OK] 총 {len(renewable_patterns)}개의 재생에너지 패턴 로드 완료")
         
         # 발전기 추가
         if 'generators' in input_data:
@@ -676,41 +678,89 @@ def create_network(input_data):
         for gen_name in network.generators.index:
             pattern_applied = False
             
-            # PV 패턴 적용 (더 넓은 범위로 매칭)
-            if ('PV' in gen_name or 'Solar' in gen_name or 'solar' in gen_name) and 'PV_pattern' in renewable_patterns:
-                # 패턴 길이 확인 및 조정
-                pattern = renewable_patterns['PV_pattern']
-                if len(pattern) != len(network.snapshots):
-                    print(f"[경고] PV 패턴 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
-                    pattern = adjust_pattern_length(pattern, len(network.snapshots))
-                
-                # 패턴을 p_max_pu에 직접 적용
-                network.generators_t.p_max_pu[gen_name] = pattern
-                
-                original_p_nom = network.generators.at[gen_name, 'p_nom']
-                pattern_sum = np.sum(pattern)
-                pattern_stats = f"패턴 합={pattern_sum:.6f}, 최대={np.max(pattern):.6f}"
-                print(f"{gen_name}: p_nom={original_p_nom:.1f}MW, {pattern_stats}")
-                pv_applied_count += 1
-                pattern_applied = True
+            # 지역 코드 추출 (발전기 이름에서 첫 부분)
+            region_code = None
+            region_codes = ['SEL', 'BSN', 'DGU', 'ICN', 'GWJ', 'DJN', 'USN', 'SJG', 
+                          'GGD', 'GWD', 'CBD', 'CND', 'JBD', 'JND', 'GBD', 'GND', 'JJD']
+            for code in region_codes:
+                if gen_name.startswith(code + '_') or gen_name.startswith(code):
+                    region_code = code
+                    break
             
-            # WT 패턴 적용 (더 넓은 범위로 매칭)
-            if ('WT' in gen_name or 'Wind' in gen_name or 'wind' in gen_name) and 'WT_pattern' in renewable_patterns:
-                # 패턴 길이 확인 및 조정
-                pattern = renewable_patterns['WT_pattern']
-                if len(pattern) != len(network.snapshots):
-                    print(f"[경고] WT 패턴 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
-                    pattern = adjust_pattern_length(pattern, len(network.snapshots))
+            # PV 패턴 적용 (지역별 + 계절별 일출/일몰 시간 반영)
+            if 'PV' in gen_name or 'Solar' in gen_name or 'solar' in gen_name:
+                pattern_key = None
                 
-                # 패턴을 p_max_pu에 직접 적용
-                network.generators_t.p_max_pu[gen_name] = pattern
+                # 지역별 패턴 우선 적용
+                if region_code:
+                    # 예: SEL_PV → SEL_PV_Patterns
+                    regional_pattern = f"{region_code}_PV_Patterns"
+                    if regional_pattern in renewable_patterns:
+                        pattern_key = regional_pattern
+                    # 폴백: BSN_PV_Patterns (전국 대표)
+                    elif 'BSN_PV_Patterns' in renewable_patterns:
+                        pattern_key = 'BSN_PV_Patterns'
                 
-                original_p_nom = network.generators.at[gen_name, 'p_nom']
-                pattern_sum = np.sum(pattern)
-                pattern_stats = f"패턴 합={pattern_sum:.6f}, 최대={np.max(pattern):.6f}"
-                print(f"{gen_name}: p_nom={original_p_nom:.1f}MW, {pattern_stats}")
-                wt_applied_count += 1
-                pattern_applied = True
+                # 구버전 호환성 (PV_pattern)
+                if not pattern_key and 'PV_pattern' in renewable_patterns:
+                    pattern_key = 'PV_pattern'
+                
+                if pattern_key and pattern_key in renewable_patterns:
+                    # 패턴 길이 확인 및 조정
+                    pattern = renewable_patterns[pattern_key].copy()
+                    if len(pattern) != len(network.snapshots):
+                        print(f"[경고] {pattern_key} 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
+                        pattern = adjust_pattern_length(pattern, len(network.snapshots))
+                    
+                    # 계절별 일출/일몰 시간 반영 (하드코딩)
+                    # 봄/가을: 6~19시, 여름: 5~20시, 겨울: 7~18시
+                    for idx, snapshot in enumerate(network.snapshots):
+                        month = snapshot.month
+                        hour = snapshot.hour
+                        
+                        # 계절 판단
+                        if month in [3, 4, 5]:  # 봄
+                            if not (6 <= hour < 19):
+                                pattern[idx] = 0.0
+                        elif month in [6, 7, 8]:  # 여름
+                            if not (5 <= hour < 20):
+                                pattern[idx] = 0.0
+                        elif month in [9, 10, 11]:  # 가을
+                            if not (6 <= hour < 19):
+                                pattern[idx] = 0.0
+                        else:  # 겨울 (12, 1, 2월)
+                            if not (7 <= hour < 18):
+                                pattern[idx] = 0.0
+                    
+                    # 패턴을 p_max_pu에 적용
+                    network.generators_t.p_max_pu[gen_name] = pattern
+                    pv_applied_count += 1
+                    pattern_applied = True
+            
+            # WT 패턴 적용 (지역별)
+            if 'WT' in gen_name or 'Wind' in gen_name or 'wind' in gen_name:
+                pattern_key = None
+                
+                # 제주는 별도 패턴, 나머지는 전국 패턴
+                if region_code == 'JJD' and 'JJD_WT_Patterns' in renewable_patterns:
+                    pattern_key = 'JJD_WT_Patterns'
+                elif 'National_WT_Patterns' in renewable_patterns:
+                    pattern_key = 'National_WT_Patterns'
+                # 구버전 호환성 (WT_pattern)
+                elif 'WT_pattern' in renewable_patterns:
+                    pattern_key = 'WT_pattern'
+                
+                if pattern_key and pattern_key in renewable_patterns:
+                    # 패턴 길이 확인 및 조정
+                    pattern = renewable_patterns[pattern_key]
+                    if len(pattern) != len(network.snapshots):
+                        print(f"[경고] {pattern_key} 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
+                        pattern = adjust_pattern_length(pattern, len(network.snapshots))
+                    
+                    # 패턴을 p_max_pu에 직접 적용
+                    network.generators_t.p_max_pu[gen_name] = pattern
+                    wt_applied_count += 1
+                    pattern_applied = True
             
             # 패턴이 적용되지 않은 재생에너지 발전기 확인
             if not pattern_applied and any(keyword in gen_name.lower() for keyword in ['pv', 'solar', 'wind', 'wt']):
@@ -721,23 +771,27 @@ def create_network(input_data):
         print(f"- WT 패턴 적용: {wt_applied_count}개 발전기")
         
         # 적용된 패턴의 통계 정보 출력
-        if 'PV_pattern' in renewable_patterns:
-            pv_pattern = renewable_patterns['PV_pattern']
-            print(f"- PV 패턴 통계: 최대 {np.max(pv_pattern):.3f}, 최소 {np.min(pv_pattern):.3f}, 평균 {np.mean(pv_pattern):.3f}")
+        pv_pattern_count = sum(1 for k in renewable_patterns.keys() if 'PV_Patterns' in k or k == 'PV_pattern')
+        wt_pattern_count = sum(1 for k in renewable_patterns.keys() if 'WT_Patterns' in k or k == 'WT_pattern')
+        print(f"- 로드된 PV 패턴: {pv_pattern_count}개")
+        print(f"- 로드된 WT 패턴: {wt_pattern_count}개")
         
-        if 'WT_pattern' in renewable_patterns:
-            wt_pattern = renewable_patterns['WT_pattern']
-            print(f"- WT 패턴 통계: 최대 {np.max(wt_pattern):.3f}, 최소 {np.min(wt_pattern):.3f}, 평균 {np.mean(wt_pattern):.3f}")
+        # 샘플 패턴 통계 출력 (처음 3개만)
+        sample_count = 0
+        for pattern_name in renewable_patterns.keys():
+            if 'PV_Patterns' in pattern_name or pattern_name == 'PV_pattern':
+                if sample_count < 3:
+                    sample_pattern = renewable_patterns[pattern_name]
+                    print(f"- 샘플 PV 패턴({pattern_name}): 최대 {np.max(sample_pattern):.3f}, 최소 {np.min(sample_pattern):.3f}, 평균 {np.mean(sample_pattern):.3f}")
+                    sample_count += 1
         
-        # 패턴 적용 후 검증
-        print("\n=== 패턴 적용 검증 ===")
-        for gen_name in network.generators.index:
-            if any(keyword in gen_name.lower() for keyword in ['pv', 'solar', 'wind', 'wt']):
-                if gen_name in network.generators_t.p_max_pu.columns:
-                    pattern_values = network.generators_t.p_max_pu[gen_name]
-                    print(f"{gen_name}: 패턴 적용됨 - 평균 {np.mean(pattern_values):.3f}, 변동성 {np.std(pattern_values):.3f}")
-                else:
-                    print(f"[경고] {gen_name}: 패턴 적용되지 않음 - 기본값 1.0 사용")
+        sample_count = 0
+        for pattern_name in renewable_patterns.keys():
+            if 'WT_Patterns' in pattern_name or pattern_name == 'WT_pattern':
+                if sample_count < 3:
+                    sample_pattern = renewable_patterns[pattern_name]
+                    print(f"- 샘플 WT 패턴({pattern_name}): 최대 {np.max(sample_pattern):.3f}, 최소 {np.min(sample_pattern):.3f}, 평균 {np.mean(sample_pattern):.3f}")
+                    sample_count += 1
         
         # 발전기 최대/최소 출력비율(p_max_pu/p_min_pu) 반영
         # 주의: efficiency는 p_max_pu에 곱하지 않음 (발전량 제한이 아닌 연료소비량 계산에만 사용)
@@ -1650,8 +1704,8 @@ def create_network(input_data):
                                 carrier_attribute="co2_emissions",
                                 sense="<=",
                                 constant=limit_value)
-                    print(f"[OK] PyPSA CO2 배출량 제약조건 추가됨: ≤ {limit_value/1e6:.1f}백만톤")
-                    print(f"   올바른 carrier 설정으로 실제 제약조건 적용됩니다.")
+                    print(f"[OK] PyPSA CO2 배출량 제약조건 추가됨: ≤ {limit_value/1e6:.1f}백만톤 (전력량 기준)")
+                    print(f"   carrier.co2_emissions는 efficiency 보정됨 (전력량기준 × 평균효율)")
                 else:
                     print("경고: constraints 시트에 'constant' 컬럼이 없어 CO2Limit을 적용하지 못했습니다.")
             
@@ -1923,6 +1977,7 @@ def optimize_network(network):
         option_variants = [
             {'name': 'barrier', 'opts': {'threads': num_cores, 'lpmethod': 4, 'parallel': 1, 'barrier.algorithm': 3}}
         ]
+        print(f"[최적화 설정] 스레드: {num_cores}개")
         
         last_status = None
         last_error = None
@@ -2126,10 +2181,16 @@ def build_final_energy_supply_tables(network):
             if val <= 0:
                 continue
             
-            # 배출량 계산 (PyPSA 내부 방식)
+            # 배출량 계산 (전력량 기준)
+            # carrier.co2_emissions는 efficiency가 곱해진 값이므로
+            # 결과 시트에는 원래 전력량 기준 배출계수를 표시하기 위해 efficiency로 나눔
             gen_carrier = network.generators.at[gen, 'carrier']
             emission_factor = emission_factors.get(gen_carrier, 0.0)
-            emissions = val * emission_factor
+            gen_efficiency = network.generators.at[gen, 'efficiency'] if 'efficiency' in network.generators.columns else 1.0
+            
+            # 전력량 기준 배출계수 = carrier.co2 / efficiency (원래 값으로 복원)
+            emission_factor_per_mwh = emission_factor / gen_efficiency if gen_efficiency > 0 else emission_factor
+            emissions = val * emission_factor_per_mwh
             
             rows_total.append([final_energy, tech, val, emissions])
             region = gen.split('_')[0] if '_' in gen else ''
