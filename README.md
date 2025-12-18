@@ -1,212 +1,335 @@
-# PyPSA_KOREA_GESI 🇰🇷
+# GESI Annual Report 데이터베이스 시스템
 
-한국 전력 시스템 최적화를 위한 PyPSA 기반 에너지 시스템 통합 분석 도구
+**녹색에너지전략연구소(GESI)** 홈페이지와 연동하여 연간 보고서 작성을 위한 데이터를 자동으로 수집하고 관리하는 시스템입니다.
 
-## 📋 프로젝트 개요
+## ✨ 주요 특징
 
-PyPSA_KOREA_GESI는 한국의 전력 시스템을 모델링하고 최적화하기 위한 종합적인 도구입니다. PyPSA(Python for Power System Analysis) 프레임워크를 기반으로 하여 한국의 17개 광역시도별 에너지 시스템을 분석할 수 있습니다.
+- 🔄 **자동 데이터 수집**: GESI 홈페이지에서 신규 콘텐츠 자동 수집
+- 🚫 **중복 방지**: 해시 기반 중복 검사로 신규 항목만 추가
+- 📊 **데이터베이스 관리**: SQLite 기반 체계적인 데이터 관리
+- 📈 **Annual Report 생성**: 연도별 데이터 집계 및 Excel 파일 자동 생성
+- ⏰ **정기 실행 지원**: 스케줄러 연동으로 자동화 가능
 
-### 🎯 주요 기능
+## 📦 파일 구성
 
-- **지역별 전력 시스템 모델링**: 17개 광역시도별 발전, 송전, 부하 시스템
-- **재생에너지 통합 분석**: 태양광(PV), 풍력(WT) 발전 패턴 적용
-- **송전선로 최적화**: 지역간 전력 조류 및 송전 용량 분석
-- **에너지 저장 시스템**: ESS, 수소 저장 등 다양한 저장 기술 모델링
-- **시각화**: 한국 지도 기반 결과 시각화 및 대시보드
+```
+├── gesi_annual_report_system.py      # 메인 시스템 코드
+├── demo_gesi_system.py               # 데모/테스트 스크립트
+├── analyze_gesi_website.py           # 웹사이트 구조 분석 도구
+├── requirements_annual_report.txt    # 필수 패키지 목록
+├── run_gesi_collector.bat            # Windows 실행 배치 파일
+├── GESI_Annual_Report_사용가이드.md  # 상세 사용 가이드
+└── README_GESI_Annual_Report.md      # 이 파일
+```
 
 ## 🚀 빠른 시작
 
-### 1. 환경 설정
+### 1단계: 패키지 설치
 
 ```bash
-# 저장소 클론
-git clone https://github.com/your-username/PyPSA_KOREA_GESI.git
-cd PyPSA_KOREA_GESI
-
-# 가상환경 생성 (권장)
-python -m venv pypsa_env
-source pypsa_env/bin/activate  # Linux/Mac
-# 또는
-pypsa_env\Scripts\activate     # Windows
-
-# 패키지 설치
-pip install -r requirements.txt
+pip install -r requirements_annual_report.txt
 ```
 
-### 2. 실행
+### 2단계: 실행
 
+**방법 1: 배치 파일 실행 (Windows)**
 ```bash
-# 메인 분석 실행
-python PyPSA_GUI.py
+run_gesi_collector.bat
 ```
 
-## 📁 프로젝트 구조
-
-```
-PyPSA_KOREA_GESI/
-├── PyPSA_GUI.py                    # 메인 실행 파일
-├── integrated_input_data.xlsx      # 통합 입력 데이터
-├── README.md
-├── requirements.txt
-├── .gitignore
-├── src/                            # 소스 코드
-│   ├── korea_map.py               # 한국 지도 시각화
-│   ├── analyze_regional_results.py # 지역별 결과 분석
-│   ├── PyPSA_HD_Regional.py       # 지역별 모델링
-│   └── ...
-├── data/                          # 입력 데이터
-│   ├── integrated_input_data.xlsx
-│   ├── regional_input_template.xlsx
-│   └── map_data/                  # 한국 지도 데이터
-└── results/                       # 결과 파일 (자동 생성)
+**방법 2: Python 직접 실행**
+```bash
+python gesi_annual_report_system.py
 ```
 
-## 🔧 주요 구성 요소
-
-### 1. 네트워크 모델링
-- **버스(Bus)**: 17개 광역시도별 AC, 수소, 열 버스
-- **발전기(Generator)**: 원자력, 석탄, LNG, 태양광, 풍력, 수소 발전
-- **부하(Load)**: 전력, 수소, 열 부하
-- **저장장치(Store)**: 배터리, 수소 저장
-- **송전선로(Line)**: 지역간 송전 연결
-
-### 2. 데이터 구조
-- **buses**: 버스 정보 (이름, 전압, 캐리어, 좌표)
-- **generators**: 발전기 정보 (용량, 비용, 효율)
-- **loads**: 부하 정보 (시간별 부하 패턴)
-- **stores**: 저장장치 정보 (용량, 효율)
-- **lines**: 송전선로 정보 (용량, 임피던스)
-- **renewable_patterns**: 재생에너지 발전 패턴
-- **load_patterns**: 지역별 부하 패턴
-
-### 3. 최적화 엔진
-- **CPLEX Solver**: 고성능 선형 최적화
-- **병렬 처리**: 멀티코어 CPU 활용
-- **제약 조건**: CO2 배출 제한, 용량 제약
-
-## 📊 결과 분석
-
-실행 후 `results/` 폴더에 다음 결과들이 생성됩니다:
-
-### 📈 Excel 결과 파일
-- `optimization_result_YYYYMMDD_HHMMSS.xlsx`: 종합 최적화 결과
-- 시트별 상세 결과:
-  - Generator_Output: 발전기별 시간별 출력
-  - Line_Flow: 송전선로별 조류
-  - Storage_Power: 저장장치 충방전
-  - Bus_Info: 버스 정보
-  - Summary: 최적화 요약
-
-### 📊 시각화 결과
-- `regional_energy_balance.png`: 지역별 에너지 밸런스
-- `regional_renewable_ratio.png`: 지역별 재생에너지 비율
-- `transmission_network_graph.png`: 송전망 네트워크
-- `korea_map.html`: 인터랙티브 한국 지도
-- `transmission_flow_map.html`: 송전 조류 지도
-
-### 📋 CSV 데이터
-- `generator_output.csv`: 발전기 출력 데이터
-- `load.csv`: 부하 데이터
-- `storage.csv`: 저장장치 데이터
-- `line_usage.csv`: 송전선로 이용률
-
-## ⚙️ 설정 및 커스터마이징
-
-### 1. 시간 설정
-`data/regional_time_settings.json`에서 분석 기간 설정:
-```json
-{
-  "start_time": "2023-01-01 00:00:00",
-  "end_time": "2023-12-31 23:00:00",
-  "frequency": "1h"
-}
+**방법 3: 데모 실행 (기능 테스트)**
+```bash
+python demo_gesi_system.py
 ```
 
-### 2. 지역별 데이터 수정
-`data/regional_input_template.xlsx`에서 지역별 파라미터 조정 가능
+### 3단계: 결과 확인
 
-### 3. 재생에너지 패턴
-`integrated_input_data.xlsx`의 `renewable_patterns` 시트에서 시간별 발전 패턴 설정
+- **데이터베이스**: `gesi_annual_report.db`
+- **Excel 파일**: `annual_reports/GESI_Annual_Report_2024.xlsx`
+
+## 💡 사용 예시
+
+### 예시 1: 전체 데이터 수집
+
+```python
+from gesi_annual_report_system import GESIAnnualReportCollector
+
+collector = GESIAnnualReportCollector(headless=True)
+
+try:
+    # 모든 데이터 수집 (Library 5페이지까지)
+    results = collector.update_all(max_library_pages=5)
+    
+    # 결과 확인
+    print(f"보고서: {results['library']['new']}/{results['library']['total']} 신규")
+    print(f"프로젝트: {results['projects']['new']}/{results['projects']['total']} 신규")
+    print(f"이벤트: {results['events']['new']}/{results['events']['total']} 신규")
+    
+finally:
+    collector.close()
+```
+
+### 예시 2: 특정 연도 Annual Report 생성
+
+```python
+from gesi_annual_report_system import GESIAnnualReportCollector
+
+collector = GESIAnnualReportCollector(headless=True)
+
+try:
+    # 2024년 보고서 생성
+    collector.export_to_excel(year=2024, output_dir="reports_2024")
+    
+    # 2023년 보고서 생성
+    collector.export_to_excel(year=2023, output_dir="reports_2023")
+    
+finally:
+    collector.close()
+```
+
+### 예시 3: 데이터 조회
+
+```python
+from gesi_annual_report_system import GESIDatabase
+
+db = GESIDatabase()
+
+try:
+    # 2024년 보고서 조회
+    reports_2024 = db.get_library(year=2024)
+    print(f"2024년 발간물: {len(reports_2024)}건")
+    
+    # 카테고리별 조회
+    research_reports = db.get_library(category="연구보고서")
+    print(f"연구보고서: {len(research_reports)}건")
+    
+    # 진행중인 프로젝트 조회
+    ongoing_projects = db.get_projects(status="진행중")
+    print(f"진행중인 프로젝트: {len(ongoing_projects)}건")
+    
+finally:
+    db.close()
+```
+
+## 📊 수집되는 데이터
+
+### 1. Library (보고서/발간물)
+- 보고서 번호, 카테고리, 제목
+- 저자, 발간일, 조회수
+- 상세 페이지 URL
+
+### 2. Projects (프로젝트/과제)
+- 프로젝트명, 과제 코드
+- 연도, 상태 (진행중/완료)
+- 설명, 예산, 연구자 정보
+
+### 3. Events (행사/이벤트)
+- 행사명, 행사 유형
+- 날짜, 장소
+- 설명, 주최자
+
+## 🔧 시스템 구조
+
+```
+┌─────────────────────────────────────────────────┐
+│           GESI Annual Report System             │
+└─────────────────────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        │               │               │
+┌───────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐
+│  Web Scraper │ │  Database  │ │   Excel    │
+│  (Selenium)  │ │  (SQLite)  │ │  Export    │
+└──────────────┘ └────────────┘ └────────────┘
+        │               │               │
+┌───────▼──────────────┐│               │
+│  https://gesi.kr     ││               │
+│  ├─ /library         ││               │
+│  ├─ /projects        ││               │
+│  └─ /EVENTS          ││               │
+└──────────────────────┘│               │
+                        │               │
+                ┌───────▼───────┐       │
+                │  .db 파일     │       │
+                │  ├─ library   │       │
+                │  ├─ projects  │       │
+                │  ├─ events    │       │
+                │  └─ history   │       │
+                └───────────────┘       │
+                                        │
+                                ┌───────▼────────┐
+                                │  .xlsx 파일    │
+                                │  ├─ 요약       │
+                                │  ├─ 발간물     │
+                                │  ├─ 프로젝트   │
+                                │  └─ 행사       │
+                                └────────────────┘
+```
+
+## 🔄 자동화 설정
+
+### Windows 작업 스케줄러
+
+1. **작업 스케줄러 실행**: `taskschd.msc`
+2. **작업 만들기**:
+   - 이름: "GESI 데이터 수집"
+   - 트리거: 매일 오전 9시
+   - 동작: `run_gesi_collector.bat` 실행
+   - 시작 위치: 프로젝트 폴더
+
+### Python 스케줄러 (schedule 라이브러리)
+
+```python
+import schedule
+import time
+
+def collect_data():
+    from gesi_annual_report_system import GESIAnnualReportCollector
+    collector = GESIAnnualReportCollector(headless=True)
+    try:
+        collector.update_all(max_library_pages=3)
+    finally:
+        collector.close()
+
+# 매일 오전 9시 실행
+schedule.every().day.at("09:00").do(collect_data)
+
+# 매주 월요일 실행
+schedule.every().monday.at("09:00").do(collect_data)
+
+while True:
+    schedule.run_pending()
+    time.sleep(60)
+```
+
+## 📋 데이터베이스 스키마
+
+### library (보고서)
+```sql
+CREATE TABLE library (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT UNIQUE NOT NULL,
+    no TEXT,
+    category TEXT,
+    title TEXT NOT NULL,
+    author TEXT,
+    published_date DATE,
+    views INTEGER,
+    url TEXT,
+    file_url TEXT,
+    summary TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### projects (프로젝트)
+```sql
+CREATE TABLE projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT UNIQUE NOT NULL,
+    project_name TEXT NOT NULL,
+    project_code TEXT,
+    year TEXT,
+    start_date DATE,
+    end_date DATE,
+    status TEXT,
+    project_type TEXT,
+    funding_agency TEXT,
+    principal_investigator TEXT,
+    description TEXT,
+    budget TEXT,
+    url TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### events (행사)
+```sql
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT UNIQUE NOT NULL,
+    event_name TEXT NOT NULL,
+    event_type TEXT,
+    event_date DATE,
+    location TEXT,
+    description TEXT,
+    organizer TEXT,
+    participants TEXT,
+    url TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+## ⚠️ 문제 해결
+
+### ChromeDriver 오류
+```
+❌ Chrome WebDriver 초기화 실패
+```
+
+**해결:**
+```bash
+pip install webdriver-manager
+```
+
+### Selenium이 데이터를 찾지 못함
+
+**해결:**
+1. `headless=False`로 브라우저 확인
+2. GESI 웹사이트 구조 변경 가능성 확인
+3. `analyze_gesi_website.py` 실행하여 구조 재분석
+
+### 패키지 설치 오류
+
+**해결:**
+```bash
+pip install --upgrade pip
+pip install -r requirements_annual_report.txt --upgrade
+```
+
+## 📚 참고 문서
+
+- **상세 사용 가이드**: `GESI_Annual_Report_사용가이드.md`
+- **웹사이트 분석 도구**: `analyze_gesi_website.py`
+- **데모 스크립트**: `demo_gesi_system.py`
+
+## 🔐 보안 및 윤리
+
+- 이 시스템은 **공개된 웹사이트**에서만 데이터를 수집합니다
+- **적절한 딜레이**(2초)를 두어 서버 부하를 최소화합니다
+- 개인정보는 수집하지 않습니다
+- 수집된 데이터는 연구소 내부 용도로만 사용됩니다
 
 ## 🛠️ 기술 스택
 
 - **Python 3.8+**
-- **PyPSA**: 전력 시스템 분석 프레임워크
-- **CPLEX**: 최적화 솔버
-- **Pandas**: 데이터 처리
-- **Matplotlib/Plotly**: 시각화
-- **Geopandas**: 지리 데이터 처리
-- **NetworkX**: 네트워크 분석
+- **Selenium**: 동적 웹 페이지 스크래핑
+- **SQLite**: 데이터베이스
+- **Pandas**: 데이터 처리 및 분석
+- **openpyxl**: Excel 파일 생성
 
-## 📋 요구사항
+## 📝 라이센스
 
-### 필수 패키지
-```
-pypsa>=0.21.0
-pandas>=1.3.0
-numpy>=1.21.0
-matplotlib>=3.5.0
-plotly>=5.0.0
-geopandas>=0.10.0
-networkx>=2.6.0
-openpyxl>=3.0.0
-```
+이 코드는 GESI 연구소 내부 사용을 위해 작성되었습니다.
 
-### 솔버
-- **CPLEX**: 상용 최적화 솔버 (권장)
-- **Gurobi**: 대안 상용 솔버
-- **HiGHS**: 오픈소스 솔버 (기본)
+## 📞 문의
 
-## 🔍 사용 예시
-
-### 기본 실행
-```python
-from PyPSA_GUI import *
-
-# 데이터 로드
-input_data = read_input_data('integrated_input_data.xlsx')
-
-# 네트워크 생성
-network = create_network(input_data)
-
-# 최적화 실행
-optimize_network(network)
-
-# 결과 저장
-save_results(network)
-```
-
-### 지역별 분석
-```python
-from src.analyze_regional_results import analyze_regional_results
-
-# 지역별 상세 분석
-analyze_regional_results(network, 'results/', '20231201_120000')
-```
-
-## 🤝 기여하기
-
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## 📄 라이선스
-
-이 프로젝트는 MIT 라이선스 하에 배포됩니다. 자세한 내용은 `LICENSE` 파일을 참조하세요.
-
-## 📞 연락처
-
-- **프로젝트 링크**: [https://github.com/your-username/PyPSA_KOREA_GESI](https://github.com/your-username/PyPSA_KOREA_GESI)
-- **이슈 리포트**: [Issues](https://github.com/your-username/PyPSA_KOREA_GESI/issues)
-
-## 🙏 감사의 말
-
-- [PyPSA](https://pypsa.org/) 개발팀
-- 한국 전력 시스템 데이터 제공 기관들
-- 오픈소스 커뮤니티
+시스템 관련 문의:
+- **개발자**: [담당자 이름]
+- **이메일**: [이메일 주소]
+- **연구소**: 녹색에너지전략연구소 (https://gesi.kr)
 
 ---
 
-**PyPSA_KOREA_GESI**로 한국의 지속가능한 에너지 미래를 설계해보세요! 🌱⚡ 
+**버전**: 1.0.0  
+**최종 업데이트**: 2024-12-18  
+**개발**: Python 3.x
+

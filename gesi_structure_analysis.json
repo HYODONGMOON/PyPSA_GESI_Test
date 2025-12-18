@@ -1,0 +1,42 @@
+{
+  "base_url": "https://gesi.kr",
+  "valid_sections": [
+    [
+      "library",
+      "https://gesi.kr/library"
+    ],
+    [
+      "연구",
+      "https://gesi.kr/research"
+    ],
+    [
+      "발간물",
+      "https://gesi.kr/publication"
+    ],
+    [
+      "보고서",
+      "https://gesi.kr/report"
+    ],
+    [
+      "프로젝트",
+      "https://gesi.kr/project"
+    ],
+    [
+      "과제",
+      "https://gesi.kr/projects"
+    ],
+    [
+      "행사",
+      "https://gesi.kr/event"
+    ],
+    [
+      "활동",
+      "https://gesi.kr/activity"
+    ],
+    [
+      "소식",
+      "https://gesi.kr/news"
+    ]
+  ],
+  "analysis_date": "2025-12-18 11:07:14"
+}
