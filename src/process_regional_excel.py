@@ -55,6 +55,10 @@ class RegionalExcelProcessor:
         
         # 발전 패턴
         self.patterns = {}
+        
+        # Coal_DB 데이터
+        self.coal_db_generators = None  # DataFrame으로 저장
+        self.region_coal_params = {}  # 지역별 Coal 발전기 파라미터
     
     def process_excel(self):
         """Excel 파일 처리 및 통합 데이터 생성"""
@@ -67,6 +71,10 @@ class RegionalExcelProcessor:
             # 엑셀 파일 열기
             print(f"Excel 파일 '{self.excel_path}' 읽는 중...")
             wb = openpyxl.load_workbook(self.excel_path, data_only=True)
+            
+            # 0. Coal_DB 읽기 (지역별 데이터보다 먼저)
+            if not self.read_coal_db(wb):
+                print("경고: Coal_DB 읽기 실패. 계속 진행합니다.")
             
             # 1. 선택된 지역 읽기
             if not self.read_selected_regions(wb):
@@ -101,6 +109,91 @@ class RegionalExcelProcessor:
             
         except Exception as e:
             print(f"오류 발생: {str(e)}")
+            traceback.print_exc()
+            return False
+    
+    def read_coal_db(self, wb):
+        """Coal_DB 시트에서 개별 석탄발전기 정보 읽기
+        
+        Args:
+            wb (openpyxl.Workbook): 워크북 객체
+            
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            if 'Coal_DB' not in wb.sheetnames:
+                print("Coal_DB 시트가 없습니다. Coal 발전기는 aggregation 방식으로 처리됩니다.")
+                return True  # 시트가 없어도 실패로 처리하지 않음
+            
+            ws = wb['Coal_DB']
+            
+            # D2 셀에서 선택연도 읽기
+            selected_year = ws['D2'].value
+            if isinstance(selected_year, str):
+                try:
+                    selected_year = int(selected_year)
+                except ValueError:
+                    pass
+            
+            print(f"Coal_DB 선택연도: {selected_year}")
+            
+            # Row 5가 헤더: A5=지역, D5=발전소, E5=호기, F5~AF5=연도(2024~2050), AM5=효율
+            year_to_col = {}
+            for col_idx in range(6, 33):  # F(6)부터 AF(32)까지
+                year_val = ws.cell(5, col_idx).value
+                if year_val:
+                    try:
+                        year_int = int(str(year_val).strip())
+                        year_to_col[year_int] = col_idx
+                    except (ValueError, AttributeError):
+                        continue
+            
+            # 선택연도에 해당하는 열 찾기
+            if selected_year not in year_to_col:
+                print(f"경고: 선택연도 {selected_year}가 Coal_DB에 없습니다.")
+                print(f"사용 가능한 연도: {sorted(year_to_col.keys())}")
+                return False
+            
+            capacity_col = year_to_col[selected_year]
+            print(f"  {selected_year}년 용량은 {openpyxl.utils.get_column_letter(capacity_col)}열")
+            
+            # 데이터 읽기 (6번 행부터)
+            coal_generators = []
+            for row_idx in range(6, ws.max_row + 1):
+                region = ws.cell(row_idx, 1).value  # A열: 지역
+                plant_name = ws.cell(row_idx, 4).value  # D열: 발전소
+                unit = ws.cell(row_idx, 5).value  # E열: 호기
+                capacity = ws.cell(row_idx, capacity_col).value  # 선택연도 용량
+                efficiency = ws.cell(row_idx, 39).value  # AM열: 효율
+                
+                # 유효한 데이터만 추가
+                if region and plant_name:
+                    try:
+                        capacity_val = float(capacity) if capacity else 0.0
+                        efficiency_val = float(efficiency) if efficiency else 0.45  # 기본값
+                        
+                        if capacity_val > 0:  # 용량이 0보다 큰 경우만
+                            coal_generators.append({
+                                'region': str(region).strip(),
+                                'plant_name': str(plant_name).strip(),
+                                'unit': str(unit).strip() if unit else '1',
+                                'capacity_MW': capacity_val,
+                                'efficiency': efficiency_val
+                            })
+                    except (ValueError, TypeError):
+                        continue
+            
+            self.coal_db_generators = pd.DataFrame(coal_generators)
+            print(f"  Coal_DB에서 {len(self.coal_db_generators)}개의 석탄발전기 로드됨")
+            if not self.coal_db_generators.empty:
+                print(f"  지역별 발전기 수: {dict(self.coal_db_generators['region'].value_counts())}")
+                print(f"  총 용량: {self.coal_db_generators['capacity_MW'].sum():.1f} MW")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Coal_DB 읽기 중 오류: {str(e)}")
             traceback.print_exc()
             return False
     
@@ -175,12 +268,74 @@ class RegionalExcelProcessor:
                     # 구 버전 호환성을 위해 개별 구성요소 시트 읽기 시도
                     self._read_separate_component_sheets(wb, region_code)
             
+            # Coal_DB의 개별 발전기 추가
+            if self.coal_db_generators is not None and not self.coal_db_generators.empty:
+                self._add_coal_db_generators()
+            
             return True
             
         except Exception as e:
             print(f"지역별 데이터 읽기 중 오류 발생: {str(e)}")
             traceback.print_exc()
             return False
+    
+    def _add_coal_db_generators(self):
+        """Coal_DB의 개별 석탄발전기를 각 지역에 추가"""
+        try:
+            print("\nCoal_DB 개별 발전기 추가 중...")
+            
+            for region_code in self.selected_regions:
+                # 해당 지역의 Coal 파라미터가 있는지 확인
+                if region_code not in self.region_coal_params:
+                    print(f"  {region_code}: Coal 파라미터 없음, 건너뜀")
+                    continue
+                
+                coal_params = self.region_coal_params[region_code]
+                
+                # 해당 지역의 Coal_DB 발전기들 필터링
+                region_coal_gens = self.coal_db_generators[
+                    self.coal_db_generators['region'] == region_code
+                ]
+                
+                if region_coal_gens.empty:
+                    print(f"  {region_code}: Coal_DB에 발전기 없음")
+                    continue
+                
+                added_count = 0
+                for idx, coal_gen in region_coal_gens.iterrows():
+                    # 개별 발전기 데이터 생성
+                    gen_name = f"{coal_gen['plant_name']}_{coal_gen['unit']}"
+                    gen_data = {
+                        'name': f"{region_code}_{gen_name}",
+                        'bus': coal_params['bus'],  # 지역의 전력 버스
+                        'carrier': 'coal',  # CO2 배출량 계산을 위해 'coal'로 설정
+                        'p_nom': coal_gen['capacity_MW'],
+                        'p_nom_extendable': False,  # 용량 확장 불가 (고정 용량)
+                        'efficiency': coal_gen['efficiency'],
+                        'marginal_cost': coal_params['marginal_cost'],
+                        'capital_cost': coal_params['capital_cost'],
+                        'p_max_pu': coal_params['p_max_pu'],
+                        'committable': coal_params['committable'],
+                        'p_min_pu': coal_params['p_min_pu'],
+                    }
+                    
+                    # ramp_limit은 None이 아닐 때만 추가
+                    if coal_params['ramp_limit_up'] is not None:
+                        gen_data['ramp_limit_up'] = coal_params['ramp_limit_up']
+                    if coal_params['ramp_limit_down'] is not None:
+                        gen_data['ramp_limit_down'] = coal_params['ramp_limit_down']
+                    
+                    # 데이터 관리자에 추가
+                    self.data_manager.add_component(region_code, 'generators', gen_data)
+                    added_count += 1
+                
+                print(f"  {region_code}: {added_count}개 석탄발전기 추가 (총 {region_coal_gens['capacity_MW'].sum():.1f} MW)")
+            
+            print(f"Coal_DB 개별 발전기 추가 완료")
+            
+        except Exception as e:
+            print(f"Coal_DB 발전기 추가 중 오류: {str(e)}")
+            traceback.print_exc()
     
     def _read_integrated_region_sheet(self, wb, region_code, sheet_name):
         """통합 지역 시트에서 데이터 읽기
@@ -262,6 +417,27 @@ class RegionalExcelProcessor:
                 for bus_field in ['bus', 'bus0', 'bus1', 'bus2', 'bus3']:
                     if bus_field in item_data and item_data[bus_field] and not str(item_data[bus_field]).startswith(f"{region_code}_"):
                         item_data[bus_field] = f"{region_code}_{item_data[bus_field]}"
+                
+                # Coal 발전기 특별 처리
+                if current_component == 'generators' and 'name' in item_data:
+                    gen_name = str(item_data.get('name', '')).upper()
+                    # Coal 발전기이면 파라미터를 저장하고 건너뛰기
+                    if 'COAL' in gen_name:
+                        # 지역별 Coal 파라미터 저장 (나중에 개별 발전기에 적용)
+                        self.region_coal_params[region_code] = {
+                            'carrier': item_data.get('carrier', 'coal'),
+                            'marginal_cost': item_data.get('marginal_cost', 0),
+                            'capital_cost': item_data.get('capital_cost', 0),
+                            'p_max_pu': item_data.get('p_max_pu', 1.0),
+                            'committable': item_data.get('committable', False),  # interface.xlsx 값 사용
+                            'p_min_pu': item_data.get('p_min_pu', 0.0),
+                            'ramp_limit_up': item_data.get('ramp_limit_up', None),
+                            'ramp_limit_down': item_data.get('ramp_limit_down', None),
+                            'bus': item_data.get('bus', ''),
+                        }
+                        print(f"  {region_code} Coal 발전기 파라미터 저장됨")
+                        # Coal 발전기는 aggregation 버전을 건너뛰고, 나중에 Coal_DB에서 개별 발전기 추가
+                        continue
                 
                 # 데이터 관리자에 추가
                 if item_data and current_component:
@@ -893,6 +1069,26 @@ class RegionalExcelProcessor:
                         pass
             except Exception:
                 pass
+            
+            # Carriers 시트 추가 (CO2 배출계수 정의 - PyPSA_GUI.py와 동일한 값 사용)
+            carriers_data = {
+                'name': ['coal', 'gas', 'nuclear', 'solar', 'wind', 'electricity', 'AC', 'hydrogen', 'heat', 'EV'],
+                'co2_emissions': [
+                    0.8384 * 0.47,  # 석탄: 전력량기준 0.8384 × 평균효율 0.47 = 0.394048
+                    0.38 * 0.53,    # LNG(gas): 전력량기준 0.38 × 평균효율 0.53 = 0.2014
+                    0.0,            # nuclear
+                    0.0,            # solar
+                    0.0,            # wind
+                    0.0,            # electricity
+                    0.0,            # AC
+                    0.0,            # hydrogen
+                    0.0,            # heat
+                    0.0             # EV
+                ],
+                'color': ['#8B4513', '#FF6347', '#9370DB', '#FFD700', '#87CEEB', '#000000', '#000000', '#4169E1', '#FF4500', '#00FF00']
+            }
+            merged_data['carriers'] = pd.DataFrame(carriers_data)
+            print("'carriers' 시트를 생성했습니다 (PyPSA_GUI.py와 동일한 CO2 배출계수 사용).")
             
             # 파일로 저장
             with pd.ExcelWriter(self.output_path, engine='openpyxl') as writer:

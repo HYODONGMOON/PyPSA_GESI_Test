@@ -628,7 +628,10 @@ def create_network(input_data):
                 def get_correct_carrier(gen_name, original_carrier):
                     """발전기 이름에서 올바른 carrier 추론"""
                     gen_lower = gen_name.lower()
-                    if any(keyword in gen_lower for keyword in ['coal', '석탄']):
+                    
+                    # 석탄발전소 이름으로 인식 (발전소 이름 포함)
+                    coal_plants = ['coal', '석탄', '당진', '영흥', '하동', '삼척', '태안', '보령', '삼천포', '호남', '동해']
+                    if any(keyword in gen_lower for keyword in coal_plants):
                         return 'coal'
                     elif any(keyword in gen_lower for keyword in ['lng', 'gas', 'chp', '가스', 'slack', 'fallback']):
                         return 'gas'  # 슬랙/폴백 발전기도 LNG 기반으로 처리
@@ -2113,7 +2116,10 @@ def _classify_technology(gen_or_link_name):
         return '풍력'
     if 'hydro' in name or 'water' in name:
         return '수력'
-    if 'coal' in name:
+    # 석탄발전소 인식 - 'coal' 키워드 또는 발전소 이름으로 판별
+    coal_plants = ['당진', '영흥', '하동', '삼척', '태안', '보령', '삼천포', '호남', '동해', 
+                   '강릉안인', '북평', '신서천', '고성', '여수', '삼척그린파워']
+    if 'coal' in name or any(plant in name for plant in coal_plants):
         return '석탄'
     if 'chp' in name:
         return 'CHP'
@@ -2422,7 +2428,43 @@ def save_results(network, filename=None, subdir=None):
                 gtp = network.generators_t.p
             except Exception:
                 gtp = pd.DataFrame()
-            gtp.to_excel(writer, sheet_name='Generator_Output')
+
+            # 석탄 세부 발전기를 지역별 합산으로 치환
+            try:
+                coal_plant_keywords = ['당진', '영흥', '하동', '삼척', '태안', '보령', '삼천포', '호남', '동해',
+                                       '강릉안인', '북평', '신서천', '고성', '여수', '삼척그린파워']
+                coal_detail_cols = [c for c in gtp.columns
+                                    if ('coal' in str(network.generators.at[c, 'carrier']).lower()
+                                        if c in network.generators.index else False)
+                                    or any(kw in c for kw in coal_plant_keywords)]
+
+                if coal_detail_cols:
+                    # 석탄 세부 발전기 → 별도 시트에 저장
+                    gtp[coal_detail_cols].to_excel(writer, sheet_name='Generator_Output_Coal')
+
+                    # 지역별 합산 컬럼 생성 (예: CND_석탄, GND_석탄, ...)
+                    region_coal_agg = {}
+                    for col in coal_detail_cols:
+                        region = col.split('_')[0] if '_' in col else 'ETC'
+                        agg_col = f'{region}_Coal'
+                        if agg_col not in region_coal_agg:
+                            region_coal_agg[agg_col] = gtp[col].copy()
+                        else:
+                            region_coal_agg[agg_col] += gtp[col]
+
+                    # 원본에서 석탄 세부 컬럼 제거 후 지역별 합산 컬럼 추가
+                    gtp_agg = gtp.drop(columns=coal_detail_cols)
+                    coal_agg_df = pd.DataFrame(region_coal_agg, index=gtp.index)
+                    gtp_agg = pd.concat([gtp_agg, coal_agg_df], axis=1)
+                    print(f"Generator_Output: 석탄 세부 {len(coal_detail_cols)}개 → 지역별 합산 {len(region_coal_agg)}개로 대체")
+                    print(f"Generator_Output_Coal: 석탄 세부 발전기 {len(coal_detail_cols)}개 저장")
+                else:
+                    gtp_agg = gtp
+
+                gtp_agg.to_excel(writer, sheet_name='Generator_Output')
+            except Exception as _e_coal_agg:
+                print(f"Generator_Output 석탄 합산 경고: {_e_coal_agg}")
+                gtp.to_excel(writer, sheet_name='Generator_Output')
 
             # AC 선로 조류 결과
             try:
@@ -2602,7 +2644,30 @@ def save_results(network, filename=None, subdir=None):
 
         # 발전기 출력
         try:
-            network.generators_t.p.to_csv(f'{results_dir}/optimization_result_{current_time}_generator_output.csv')
+            gtp_csv = network.generators_t.p
+            coal_plant_keywords = ['당진', '영흥', '하동', '삼척', '태안', '보령', '삼천포', '호남', '동해',
+                                   '강릉안인', '북평', '신서천', '고성', '여수', '삼척그린파워']
+            coal_detail_cols_csv = [c for c in gtp_csv.columns
+                                    if ('coal' in str(network.generators.at[c, 'carrier']).lower()
+                                        if c in network.generators.index else False)
+                                    or any(kw in c for kw in coal_plant_keywords)]
+            if coal_detail_cols_csv:
+                # 석탄 세부 → 별도 CSV
+                gtp_csv[coal_detail_cols_csv].to_csv(f'{results_dir}/optimization_result_{current_time}_generator_output_coal.csv')
+                # 지역별 합산 후 기존 CSV
+                region_coal_agg_csv = {}
+                for col in coal_detail_cols_csv:
+                    region = col.split('_')[0] if '_' in col else 'ETC'
+                    agg_col = f'{region}_Coal'
+                    if agg_col not in region_coal_agg_csv:
+                        region_coal_agg_csv[agg_col] = gtp_csv[col].copy()
+                    else:
+                        region_coal_agg_csv[agg_col] += gtp_csv[col]
+                gtp_csv_agg = gtp_csv.drop(columns=coal_detail_cols_csv)
+                gtp_csv_agg = pd.concat([gtp_csv_agg, pd.DataFrame(region_coal_agg_csv, index=gtp_csv.index)], axis=1)
+                gtp_csv_agg.to_csv(f'{results_dir}/optimization_result_{current_time}_generator_output.csv')
+            else:
+                gtp_csv.to_csv(f'{results_dir}/optimization_result_{current_time}_generator_output.csv')
         except Exception:
             pass
 
