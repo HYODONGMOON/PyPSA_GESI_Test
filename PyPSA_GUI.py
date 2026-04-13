@@ -4220,6 +4220,10 @@ def ensure_integrated_input():
                     _wb = _oxl.load_workbook(interface_path, data_only=True)
                     _steps_ok = True
                     _steps_ok &= bool(proc.read_selected_regions(_wb))
+                    # Coal_DB를 반드시 read_regional_data 이전에 호출해야 함
+                    _coal_ok = proc.read_coal_db(_wb)
+                    if not _coal_ok:
+                        print("경고: Coal_DB 읽기 실패 (계속 진행)")
                     _steps_ok &= bool(proc.read_regional_data(_wb))
                     _steps_ok &= bool(proc.read_connections(_wb))
                     _steps_ok &= bool(proc.read_timeseries(_wb))
@@ -4657,6 +4661,21 @@ def _persist_standardized_input(integrated_path, input_data):
             for sn, df in sheets.items():
                 # 인덱스 제거하여 저장
                 df.to_excel(writer, sheet_name=sn, index=False)
+        # 저장 후 수정 시간을 interface.xlsx보다 늦게 설정
+        # → 다음 실행 시 ensure_integrated_input()이 불필요한 재생성을 하지 않도록 함
+        try:
+            root_dir = os.path.dirname(os.path.abspath(integrated_path))
+            interface_path = os.path.join(root_dir, 'interface.xlsx')
+            if os.path.exists(interface_path):
+                import time as _time
+                iface_mtime = os.path.getmtime(interface_path)
+                integ_mtime = os.path.getmtime(integrated_path)
+                if integ_mtime <= iface_mtime:
+                    # integrated가 interface보다 오래됐으면 현재 시간으로 갱신
+                    new_mtime = _time.time() + 1
+                    os.utime(integrated_path, (new_mtime, new_mtime))
+        except Exception:
+            pass
         print(f"표준화된 버스명이 '{integrated_path}'에 저장되었습니다.")
         return True
     except Exception as e:
@@ -5004,46 +5023,210 @@ def _update_integrated_for_year(integrated_path, interface_path, year):
         print(f"연도별 통합 입력 갱신 실패: {str(e)}")
         return False
 
-def main():
-    # 지도 시각화 - 임시로 주석 처리
-    # visualizer = KoreaMapVisualizer()
-    # if visualizer.load_map_data():
-    #     visualizer.plot_korea_map()
-    
-    # 통합 입력 자동 생성/업데이트
-    ensure_integrated_input()
+def _run_week_uc_analysis(input_data, full_network, uc_week):
+    """특정 주(week)에 대해 committable=True 적용 후 UC 분석 수행"""
+    import copy
 
-    # 시나리오 오버라이드 비활성화 - 지역별 시트에서 직접 값 사용
+    print("\n" + "=" * 80)
+    print(f"[Week {uc_week} UC 분석] Unit Commitment 분석 시작")
+    print("=" * 80)
+
+    # 1. 해당 주의 스냅샷 범위 계산 (1-based week, 월요일 기준)
+    all_snapshots = full_network.snapshots
+    year_start = all_snapshots[0]
+
+    # 주 번호에 해당하는 첫 번째 시각 계산 (ISO week 방식)
+    import datetime as dt
+    # 해당 연도의 첫 월요일 기준으로 주 시작
+    week_start_dt = dt.datetime.strptime(
+        f"{year_start.year}-W{uc_week:02d}-1", "%Y-W%W-%w"
+    )
+    week_end_dt = week_start_dt + dt.timedelta(days=7)
+
+    week_snapshots = all_snapshots[
+        (all_snapshots >= week_start_dt) & (all_snapshots < week_end_dt)
+    ]
+
+    if len(week_snapshots) == 0:
+        print(f"[경고] Week {uc_week}에 해당하는 스냅샷이 없습니다. UC 분석을 건너뜁니다.")
+        return
+
+    print(f"  대상 기간: {week_snapshots[0]} ~ {week_snapshots[-1]}")
+    print(f"  시간대 수: {len(week_snapshots)}개")
+
+    # 2. input_data를 복사하여 committable 활성화
+    input_data_uc = {k: v.copy() if hasattr(v, 'copy') else v
+                     for k, v in input_data.items()}
+
+    # interface.xlsx에 committable=True로 설정된 발전기만 UC 적용
+    # (현재 input_data에는 False로 강제됐을 수 있으므로, 원본 interface에서 재로드)
+    try:
+        root_dir = os.path.dirname(__file__)
+        interface_path = os.path.abspath(os.path.join(root_dir, 'interface.xlsx'))
+        xls_iface = pd.ExcelFile(interface_path)
+        # 지역별 시트에서 committable=True 발전기 이름 수집
+        uc_gen_names = set()
+        for sn in xls_iface.sheet_names:
+            try:
+                df_sn = pd.read_excel(interface_path, sheet_name=sn)
+                if 'committable' in df_sn.columns and 'name' in df_sn.columns:
+                    uc_rows = df_sn[df_sn['committable'].apply(
+                        lambda x: str(x).strip().lower() in ['true', '1', 'yes']
+                    )]
+                    for _, row in uc_rows.iterrows():
+                        uc_gen_names.add(str(row['name']).strip())
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"  [경고] interface.xlsx 재로드 실패, input_data 원본 사용: {e}")
+        uc_gen_names = set()
+
+    # integrated_input_data의 generators 중 interface에서 committable=True인 것 활성화
+    if 'generators' in input_data_uc and not input_data_uc['generators'].empty:
+        df_g = input_data_uc['generators'].copy()
+
+        def _should_enable_uc(gen_name):
+            if uc_gen_names:
+                # interface 이름과 직접 매칭 또는 prefix 매칭
+                for iface_name in uc_gen_names:
+                    if iface_name.upper() in gen_name.upper() or gen_name.upper() == iface_name.upper():
+                        return True
+            # carrier='coal' 발전기는 기본적으로 UC 대상
+            return False
+
+        uc_applied = 0
+        for idx in df_g.index:
+            gen_name = str(df_g.at[idx, 'name'])
+            gen_carrier = str(df_g.at[idx, 'carrier']).lower() if 'carrier' in df_g.columns else ''
+            if _should_enable_uc(gen_name) or gen_carrier == 'coal':
+                df_g.at[idx, 'committable'] = True
+                uc_applied += 1
+        input_data_uc['generators'] = df_g
+        print(f"  UC 적용 발전기: {uc_applied}개 (committable=True)")
+
+    # 3. 해당 주의 timeseries만 사용하도록 설정
+    if 'timeseries' in input_data_uc and not input_data_uc['timeseries'].empty:
+        ts_row = input_data_uc['timeseries'].iloc[0].copy()
+        ts_row['start_time'] = week_snapshots[0]
+        ts_row['end_time'] = week_snapshots[-1] + pd.Timedelta(hours=1)
+        input_data_uc['timeseries'] = pd.DataFrame([ts_row])
+
+    # 4. 네트워크 생성 및 최적화
+    print(f"\n  UC 네트워크 생성 중...")
+    network_uc = create_network(input_data_uc)
+
+    if network_uc is None:
+        print("  [오류] UC 네트워크 생성 실패")
+        return
+
+    # 전년도 분석 결과를 초기 상태로 활용 (해당 주 시작 시점의 발전기 상태)
+    try:
+        week_start_ts = week_snapshots[0]
+        prev_ts_candidates = all_snapshots[all_snapshots < week_start_ts]
+        if len(prev_ts_candidates) > 0:
+            prev_ts = prev_ts_candidates[-1]
+            for gen in network_uc.generators.index:
+                if network_uc.generators.at[gen, 'committable']:
+                    if (gen in full_network.generators.index and
+                            hasattr(full_network.generators_t, 'p') and
+                            gen in full_network.generators_t.p.columns and
+                            prev_ts in full_network.generators_t.p.index):
+                        prev_output = float(full_network.generators_t.p.at[prev_ts, gen])
+                        p_nom = float(network_uc.generators.at[gen, 'p_nom'])
+                        # 이전 출력량으로 초기 상태 추정
+                        if prev_output > p_nom * 0.05:
+                            network_uc.generators.at[gen, 'up_time_before'] = 1
+                        else:
+                            network_uc.generators.at[gen, 'down_time_before'] = 1
+        print(f"  이전 시점({prev_ts if len(prev_ts_candidates)>0 else '없음'}) 기준 초기 상태 설정 완료")
+    except Exception as e:
+        print(f"  [경고] 초기 상태 설정 실패 (무시): {e}")
+
+    print(f"\n  UC 최적화 실행 중 (Week {uc_week})...")
+    uc_ok = optimize_network(network_uc)
+
+    # 5. 결과 저장 (별도 폴더에 저장)
+    if uc_ok:
+        uc_subdir = f"results/week{uc_week:02d}_UC_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        print(f"\n  UC 결과 저장 중: {uc_subdir}")
+        save_results(network_uc, subdir=uc_subdir)
+        print(f"[Week {uc_week} UC 분석] 완료! 결과 폴더: {uc_subdir}")
+    else:
+        print(f"[Week {uc_week} UC 분석] 최적화 실패")
+
+
+def main():
+    # ── 분석 모드 선택 프롬프트 ──────────────────────────────────────────────
+    print("=" * 60)
+    print("  PyPSA GESI 분석 모드 선택")
+    print("=" * 60)
+    print("  all      : 전체 기간 분석 (committable 강제 False)")
+    print("  1 ~ 52   : 전체 기간 분석 후, 해당 주(week)에 대해")
+    print("             committable=True UC 분석을 추가 실행")
+    print("=" * 60)
+    try:
+        mode_input = input("분석 모드 입력 (all 또는 주 번호 1-52): ").strip().lower()
+    except EOFError:
+        mode_input = 'all'
+
+    if mode_input == 'all':
+        analysis_mode = 'all'
+        uc_week = None
+        print("\n[all 모드] 전체 기간 분석, 모든 발전기 committable=False 적용")
+    else:
+        try:
+            uc_week = int(mode_input)
+            if not (1 <= uc_week <= 52):
+                raise ValueError("범위 초과")
+            analysis_mode = 'week'
+            print(f"\n[Week {uc_week} 모드] 전체 기간(committable=False) 분석 후")
+            print(f"               Week {uc_week}에 대해 UC 분석 추가 실행")
+        except ValueError:
+            print(f"[경고] '{mode_input}'은 유효하지 않습니다. all 모드로 실행합니다.")
+            analysis_mode = 'all'
+            uc_week = None
+
+    # ── 공통 준비 ───────────────────────────────────────────────────────────
+    ensure_integrated_input()
     print("지역별 시트 원본 데이터 사용 모드로 실행...")
-    
-    # 단일년도 폴백 실행 (시나리오 오버라이드 없이)
     print("데이터 로드 시작...")
     input_data = read_input_data(INPUT_FILE)
     if input_data is None:
         return
-        
-    # 버스명 표준화(예: BSN_BSN_EL → BSN_EL)
+
     input_data = standardize_bus_names_in_input(input_data)
 
-    # 표준화된 입력을 통합 파일에 즉시 저장
     try:
         integrated_path = os.path.abspath(os.path.join(os.path.dirname(__file__), INPUT_FILE))
         _persist_standardized_input(integrated_path, input_data)
     except Exception as e:
         print(f"표준화 저장 중 오류: {str(e)}")
-        
-    check_excel_data_loading(input_data)  # 데이터 로드 상태 확인
-    
-    print("네트워크 생성 시작...")
+
+    check_excel_data_loading(input_data)
+
+    # ── all / week 공통: 전체 기간은 항상 committable=False ─────────────────
+    if 'generators' in input_data and not input_data['generators'].empty:
+        input_data['generators']['committable'] = False
+        print("[전체 기간] 모든 발전기 committable=False 강제 적용")
+
+    # ── 전체 기간 분석 ──────────────────────────────────────────────────────
+    print("\n네트워크 생성 시작...")
     network = create_network(input_data)
-    
+
     print("최적화 시작...")
-    if optimize_network(network):
+    ok = optimize_network(network)
+    if ok:
         print("결과 저장 시작...")
         save_results(network)
-        print("모든 과정 완료!")
+        print("전체 기간 분석 완료!")
     else:
-        print("최적화 실패!")
+        print("전체 기간 최적화 실패!")
+
+    # ── week 모드: 추가 UC 분석 ─────────────────────────────────────────────
+    if analysis_mode == 'week' and uc_week is not None and ok:
+        _run_week_uc_analysis(input_data, network, uc_week)
+
+    print("\n모든 과정 완료!")
 
 if __name__ == "__main__":
     main()
