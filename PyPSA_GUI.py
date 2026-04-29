@@ -88,6 +88,214 @@ def _normalize_region_code(value):
     except Exception:
         return str(value)
 
+def _read_dc_fab_from_interface(interface_path, existing_load_names):
+    """interface.xlsx 지역별 시트의 부하 섹션에서 Demand_DC / Demand_Fab 읽기.
+
+    각 지역 시트(발전_XXX)를 스캔하여 부하 이름이 'Demand_DC' 또는 'Demand_Fab'인
+    행을 찾아 {region}_Demand_DC / {region}_Demand_Fab 부하를 반환한다.
+    버스는 해당 행의 2번째 컬럼(버스명)을 사용하며, 없으면 {region}_EL로 기본 지정.
+    """
+    try:
+        import openpyxl as _opxl
+        wb = _opxl.load_workbook(interface_path, data_only=True)
+        new_loads = []
+
+        for ws in wb.worksheets:
+            sn = ws.title
+            # 지역별 시트 식별: 시트명 마지막 '_' 이후가 3자리 대문자 알파벳
+            if '_' not in sn:
+                continue
+            region = sn.rsplit('_', 1)[-1]
+            if len(region) != 3 or not region.isalpha():
+                continue
+
+            dc_load_name  = f"{region}_Demand_DC"
+            fab_load_name = f"{region}_Demand_Fab"
+
+            for row in ws.iter_rows(values_only=True):
+                if row[0] is None:
+                    continue
+                v = str(row[0]).strip()
+
+                if v == 'Demand_DC' and dc_load_name not in existing_load_names:
+                    bus  = str(row[1]).strip() if (len(row) > 1 and row[1]) else f"{region}_EL"
+                    pset = 0.0
+                    if len(row) > 3 and row[3] is not None:
+                        try:
+                            pset = float(row[3])
+                        except Exception:
+                            pass
+                    new_loads.append({
+                        'name': dc_load_name, 'region': region,
+                        'bus': bus, 'carrier': 'electricity', 'p_set': pset
+                    })
+
+                elif v == 'Demand_Fab' and fab_load_name not in existing_load_names:
+                    bus  = str(row[1]).strip() if (len(row) > 1 and row[1]) else f"{region}_EL"
+                    pset = 0.0
+                    if len(row) > 3 and row[3] is not None:
+                        try:
+                            pset = float(row[3])
+                        except Exception:
+                            pass
+                    new_loads.append({
+                        'name': fab_load_name, 'region': region,
+                        'bus': bus, 'carrier': 'electricity', 'p_set': pset
+                    })
+
+        if not new_loads:
+            return None
+        return {'loads': pd.DataFrame(new_loads)}
+    except Exception as e:
+        print(f"DC/Fab 부하 읽기 오류: {str(e)}")
+        return None
+
+
+def _read_links_from_interface(interface_path, existing_link_names):
+    """interface.xlsx 지역별 시트의 링크 섹션에서 신규 링크 읽기.
+
+    각 지역 시트(발전_XXX)를 스캔하여 링크 섹션 헤더(이름/출발버스/도착버스)를
+    찾은 뒤 데이터 행을 읽는다. integrated_input_data.xlsx에 이미 있는 링크는
+    건너뛰므로, 향후 HVDC 등 지역 간 링크를 interface.xlsx에만 추가해도 자동
+    반영된다.
+
+    컬럼 순서 (0-indexed, 지역별 시트 링크 헤더 기준):
+      0:이름  1:출발버스  2:도착버스  3:버스2  4:버스3
+      5:효율0  6:효율1  7:효율2  8:효율3
+      9:정격용량(MW)  10:용량확대가능  11:최소용량(MW)  12:최대용량(MW)
+      13:자본비용  14:한계비용
+    """
+    try:
+        import openpyxl as _opxl
+        wb = _opxl.load_workbook(interface_path, data_only=True)
+        new_links = []
+
+        # 컬럼 인덱스 고정 매핑
+        CI = {
+            'name': 0, 'bus0': 1, 'bus1': 2, 'bus2': 3, 'bus3': 4,
+            'efficiency0': 5, 'efficiency1': 6, 'efficiency2': 7, 'efficiency3': 8,
+            'p_nom': 9, 'p_nom_extendable': 10, 'p_nom_min': 11, 'p_nom_max': 12,
+            'capital_cost': 13, 'marginal_cost': 14,
+        }
+
+        def _sf(v):
+            if v is None:
+                return float('nan')
+            try:
+                return float(v)
+            except Exception:
+                return float('nan')
+
+        def _sb(v):
+            if v is None:
+                return False
+            if isinstance(v, bool):
+                return v
+            return str(v).strip().lower() in ('true', '1', 'yes', '예')
+
+        for ws in wb.worksheets:
+            sn = ws.title
+            if '_' not in sn:
+                continue
+            region = sn.rsplit('_', 1)[-1]
+            if len(region) != 3 or not region.isalpha():
+                continue
+
+            # 링크 섹션 헤더 행 탐색
+            # 인식 기준: col0='이름'(U+C774 U+B984) AND col1이 '버스'(U+BC84 U+C2A4)로
+            # 끝나면서 2글자 초과 (발전기/부하 섹션의 단순 '버스'와 구별)
+            # → interface.xlsx 실제 컬럼: 시작버스(U+C2DC U+C791+버스), 종료버스
+            _IREUM  = '\uc774\ub984'   # 이름
+            _BEOSEU = '\ubc84\uc2a4'   # 버스
+            header_row_idx = None
+            all_rows = list(ws.iter_rows(values_only=True))
+            for i, row in enumerate(all_rows):
+                if not row or row[0] is None:
+                    continue
+                v0 = str(row[0]).strip()
+                v1 = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ''
+                v2 = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ''
+                # 조건: 이름 + (버스 접미사 2글자 초과 col1) + (버스 접미사 col2)
+                # 또는 영문 bus0/bus1/from/to 표기 지원
+                is_ireum = (v0 == _IREUM or v0.lower() == 'name')
+                is_link_bus1 = (
+                    (v1.endswith(_BEOSEU) and len(v1) > len(_BEOSEU))
+                    or v1.lower() in ('bus0', 'from')
+                )
+                is_link_bus2 = (
+                    (v2.endswith(_BEOSEU) and len(v2) > len(_BEOSEU))
+                    or 'to' in v2.lower()
+                    or v2.lower() == 'bus1'
+                )
+                if is_ireum and is_link_bus1 and is_link_bus2:
+                    header_row_idx = i
+                    break
+
+            if header_row_idx is None:
+                continue
+
+            # 헤더 다음 행부터 데이터 읽기 (빈 행에서 중단)
+            for row in all_rows[header_row_idx + 1:]:
+                if not row or row[CI['name']] is None:
+                    break
+                raw_name = str(row[CI['name']]).strip()
+                if not raw_name:
+                    break
+
+                # {region}_ 접두어 보정
+                link_name = (
+                    raw_name if raw_name.startswith(f"{region}_")
+                    else f"{region}_{raw_name}"
+                )
+
+                bus0_v = str(row[CI['bus0']]).strip() if len(row) > CI['bus0'] and row[CI['bus0']] is not None else None
+                bus1_v = str(row[CI['bus1']]).strip() if len(row) > CI['bus1'] and row[CI['bus1']] is not None else None
+
+                if not bus0_v or not bus1_v:
+                    continue
+
+                # 지역 간 링크(HVDC 등): bus0·bus1의 지역코드가 다르면 항상 갱신
+                # → _persist_standardized_input이 integrated를 덮어써도 다음 실행에서 복원됨
+                bus0_region = bus0_v.split('_')[0]
+                bus1_region = bus1_v.split('_')[0]
+                is_cross_regional = (bus0_region != bus1_region)
+
+                # 같은 지역 내 링크: integrated에 이미 있으면 건너뜀 (중복 방지)
+                if link_name in existing_link_names and not is_cross_regional:
+                    continue
+
+                bus2_v = str(row[CI['bus2']]).strip() if len(row) > CI['bus2'] and row[CI['bus2']] is not None else None
+                bus3_v = str(row[CI['bus3']]).strip() if len(row) > CI['bus3'] and row[CI['bus3']] is not None else None
+
+                record = {
+                    'name': link_name,
+                    'region': region,
+                    'bus0': bus0_v,
+                    'bus1': bus1_v,
+                    'bus2': bus2_v,
+                    'bus3': bus3_v,
+                    'efficiency0': _sf(row[CI['efficiency0']] if len(row) > CI['efficiency0'] else None),
+                    'efficiency1': _sf(row[CI['efficiency1']] if len(row) > CI['efficiency1'] else None),
+                    'efficiency2': _sf(row[CI['efficiency2']] if len(row) > CI['efficiency2'] else None),
+                    'efficiency3': _sf(row[CI['efficiency3']] if len(row) > CI['efficiency3'] else None),
+                    'p_nom':           _sf(row[CI['p_nom']]           if len(row) > CI['p_nom']           else None),
+                    'p_nom_extendable': _sb(row[CI['p_nom_extendable']] if len(row) > CI['p_nom_extendable'] else None),
+                    'p_nom_min':       _sf(row[CI['p_nom_min']]       if len(row) > CI['p_nom_min']       else None),
+                    'p_nom_max':       _sf(row[CI['p_nom_max']]       if len(row) > CI['p_nom_max']       else None),
+                    'capital_cost':    _sf(row[CI['capital_cost']]    if len(row) > CI['capital_cost']    else None),
+                    'marginal_cost':   _sf(row[CI['marginal_cost']]   if len(row) > CI['marginal_cost']   else None),
+                }
+                new_links.append(record)
+                print(f"interface.xlsx 신규 링크 감지: {link_name} ({bus0_v} → {bus1_v})")
+
+        if not new_links:
+            return None
+        return pd.DataFrame(new_links)
+    except Exception as e:
+        print(f"interface.xlsx 링크 보강 읽기 오류: {str(e)}")
+        return None
+
+
 def read_input_data(input_file):
     """Excel 파일에서 입력 데이터 읽기"""
     try:
@@ -166,7 +374,67 @@ def read_input_data(input_file):
                     _persist_lines_to_integrated(integrated_path, fb)
         except Exception as e:
             print(f"lines 폴백 생성 실패: {str(e)}")
-        
+
+        # DC/Fab 부하 보강: interface.xlsx 지역별 시트에서 Demand_DC/Demand_Fab 읽기
+        # (integrated_input_data.xlsx에 아직 반영되지 않은 경우 자동 보강)
+        try:
+            if os.path.exists(interface_path):
+                existing_load_names = set(
+                    input_data['loads']['name'].astype(str)
+                ) if ('loads' in input_data and not input_data['loads'].empty and 'name' in input_data['loads'].columns) else set()
+                dc_fab = _read_dc_fab_from_interface(interface_path, existing_load_names)
+                if dc_fab is not None:
+                    if dc_fab['loads'] is not None and not dc_fab['loads'].empty:
+                        input_data['loads'] = pd.concat(
+                            [input_data['loads'], dc_fab['loads']], ignore_index=True
+                        ) if not input_data['loads'].empty else dc_fab['loads']
+                        print(f"DC/Fab 부하 보강 완료: {len(dc_fab['loads'])}개 부하 추가")
+        except Exception as e:
+            print(f"DC/Fab 부하 보강 실패: {str(e)}")
+
+        # 링크 보강: interface.xlsx 지역별 시트에서 신규 링크 읽기
+        # integrated_input_data.xlsx의 links 시트에 없는 링크(HVDC 등)를 자동 보강
+        # - 향후 HVDC 추가 시 interface.xlsx 해당 지역 시트 링크 섹션에만 입력하면 됨
+        # - integrated_input_data.xlsx에 버스가 없는 지역(흡수·삭제된 지역)은 제외
+        try:
+            if os.path.exists(interface_path):
+                existing_link_names = set(
+                    input_data['links']['name'].astype(str)
+                ) if ('links' in input_data and not input_data['links'].empty and 'name' in input_data['links'].columns) else set()
+
+                # integrated buses에서 유효한 지역 코드 추출
+                known_regions = set()
+                if 'buses' in input_data and not input_data['buses'].empty:
+                    _b = input_data['buses']
+                    if 'region' in _b.columns:
+                        known_regions = set(_b['region'].dropna().astype(str))
+                    elif 'name' in _b.columns:
+                        known_regions = set(str(n).split('_')[0] for n in _b['name'].dropna())
+
+                new_links_df = _read_links_from_interface(interface_path, existing_link_names)
+                if new_links_df is not None and not new_links_df.empty:
+                    # 유효한 지역의 링크만 남김
+                    if known_regions and 'region' in new_links_df.columns:
+                        before = len(new_links_df)
+                        new_links_df = new_links_df[new_links_df['region'].isin(known_regions)].reset_index(drop=True)
+                        skipped = before - len(new_links_df)
+                        if skipped > 0:
+                            print(f"링크 보강: {skipped}개 링크 제외 (integrated에 버스 없는 지역)")
+                    if not new_links_df.empty:
+                        # 지역 간 링크(HVDC 등)는 integrated의 기존 항목을 제거하고 교체
+                        # → bus 정보 오류가 integrated에 저장되어도 다음 실행에서 복원됨
+                        if 'links' in input_data and not input_data['links'].empty and 'name' in input_data['links'].columns:
+                            cross_names = set(new_links_df['name'].astype(str))
+                            input_data['links'] = input_data['links'][
+                                ~input_data['links']['name'].astype(str).isin(cross_names)
+                            ].reset_index(drop=True)
+                        input_data['links'] = pd.concat(
+                            [input_data['links'], new_links_df], ignore_index=True
+                        ) if not input_data['links'].empty else new_links_df
+                        print(f"링크 보강 완료: {len(new_links_df)}개 링크 추가/갱신 (interface.xlsx)")
+        except Exception as e:
+            print(f"링크 보강 실패: {str(e)}")
+
         return input_data
         
     except Exception as e:
@@ -310,13 +578,36 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
             return None
         df = input_data['load_patterns'].copy()
 
-        # 1) 고정 위치(B8:F8765)에서 직접 읽기 시도 [EV 패턴 복구]
+        # 1) 고정 위치(B8:F8765)에서 직접 읽기 시도 [EV/DC/Fab 패턴 포함]
         try:
             base_len = 8760
             start_row = 7  # Excel 8행 → iloc 7
-            col_map = {'EL': 1, 'H': 2, 'H2': 3, 'EV_DRIVING': 4, 'EV_CHARGING': 5}  # B,C,D,E,F
-            if demand_type in col_map and df.shape[0] > start_row + 10 and df.shape[1] > col_map[demand_type]:
-                series = pd.to_numeric(df.iloc[start_row:, col_map[demand_type]], errors='coerce')
+            # 열 인덱스(0-based): A=시간(0), B=전력(1), C=열(2), D=수소(3),
+            #   E=EV_DRIVING(4), F=EV_CHARGING(5), G=빈칸(6),
+            #   H=DC_patterns(7), I=Fab_patterns(8), J=빈칸(9),
+            #   K=BSN_EL_P(10), L=CBD_EL_P(11), ... (지역별 EL 패턴)
+            col_map = {
+                'EL': 1, 'H': 2, 'H2': 3, 'EV_DRIVING': 4, 'EV_CHARGING': 5,
+                'DC': 7, 'Fab': 8
+            }  # B,C,D,E,F,H,I
+
+            # 지역별 EL 패턴 우선 적용: load_patterns 5행(pandas index 4)에서 컬럼명 탐색
+            effective_col = col_map.get(demand_type)
+            if demand_type == 'EL' and region:
+                regional_col_name = f"{region}_EL_P"
+                for hdr_idx in [3, 4]:  # Excel 5행 또는 6행 (pandas index 3 또는 4)
+                    if df.shape[0] > hdr_idx:
+                        hdr = df.iloc[hdr_idx]
+                        for col_idx, val in enumerate(hdr):
+                            if str(val).strip() == regional_col_name:
+                                effective_col = col_idx
+                                print(f"지역별 EL 패턴 사용: {regional_col_name} (열 인덱스 {col_idx})")
+                                break
+                        if effective_col != col_map.get(demand_type):
+                            break
+
+            if effective_col is not None and df.shape[0] > start_row + 10 and df.shape[1] > effective_col:
+                series = pd.to_numeric(df.iloc[start_row:, effective_col], errors='coerce')
                 values = series.dropna().astype(float).values
                 if len(values) > 0:
                     # 기본 8760 채움: 부족 시 타일링
@@ -333,13 +624,20 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
                         pattern_full = np.tile(pattern_base, repeats)[:snapshots_len]
                     # 디버그 로그
                     try:
-                        label = {
-                            'EL': '전력(B열)', 
-                            'H': '열(C열)', 
+                        _base_label = {
+                            'EL': '전력(B열)',
+                            'H': '열(C열)',
                             'H2': '수소(D열)',
                             'EV_DRIVING': 'EV주행(E열)',
-                            'EV_CHARGING': 'EV충전(F열)'
-                        }[demand_type]
+                            'EV_CHARGING': 'EV충전(F열)',
+                            'DC': 'DC(H열)',
+                            'Fab': '반도체팹(I열)'
+                        }.get(demand_type, f'{demand_type}(열{effective_col})')
+                        # 지역별 EL 패턴 사용 시 레이블 보정
+                        if demand_type == 'EL' and region and effective_col != col_map.get('EL'):
+                            label = f"지역별 EL 패턴({region}_EL_P, 열{effective_col})"
+                        else:
+                            label = _base_label
                         sample_n = min(8, len(pattern_base))
                         print(f"load_patterns 고정위치 사용: {label}, 시작행 Excel 8행 기준")
                         print(f"패턴 길이(기본): {len(pattern_base)} (최대 {np.nanmax(pattern_base):.6f}, 평균 {np.nanmean(pattern_base):.6f})")
@@ -562,7 +860,7 @@ def create_network(input_data):
                           v_nom=v_nom_val,
                           carrier=carrier)
                 print(f"버스 추가됨: {bus_name} (carrier: {carrier}, v_nom: {v_nom_val})")
-        
+
         # 재생에너지 패턴 준비 (지역별)
         renewable_patterns = {}
         if 'renewable_patterns' in input_data:
@@ -641,6 +939,8 @@ def create_network(input_data):
                         return 'solar'
                     elif any(keyword in gen_lower for keyword in ['wind', 'wt', '풍력']):
                         return 'wind'
+                    elif str(original_carrier).upper() == 'DR' or gen_lower.endswith('_dr'):
+                        return 'DR'
                     else:
                         # 원본 carrier가 유효하면 사용, 아니면 electricity
                         orig = str(original_carrier).lower()
@@ -1039,7 +1339,7 @@ def create_network(input_data):
                 if 'load_patterns' in input_data:
                     # 부하 이름에서 지역과 타입 추출
                     region = name.split('_')[0] if '_' in name else None
-                    # 부하 타입 감지 (EV 포함)
+                    # 부하 타입 감지 (EV/DC/Fab 포함)
                     if '_Demand_EL' in name:
                         dtype = 'EL'
                     elif '_Demand_H2' in name:
@@ -1047,7 +1347,11 @@ def create_network(input_data):
                     elif '_Demand_H' in name:
                         dtype = 'H'
                     elif '_Demand_EV' in name or '_EV' in name:
-                        dtype = 'EV_DRIVING'  # EV 수요 패턴 적용
+                        dtype = 'EV_DRIVING'
+                    elif '_Demand_DC' in name:
+                        dtype = 'DC'   # 데이터센터 전력 수요 → DC_patterns 적용
+                    elif '_Demand_Fab' in name:
+                        dtype = 'Fab'  # 반도체팹 전력 수요 → Fab_patterns 적용
                     else:
                         dtype = None
                     
@@ -1850,6 +2154,113 @@ def optimize_network(network):
         except Exception:
             pass
         
+        # =====================================================================
+        # DR(수요반응) 설정 - 하드코딩 파라미터
+        # =====================================================================
+        DR_PEAK_PERCENTILE = 95   # 상위 5% 부하 시점에서만 발동 허용
+        DR_ANNUAL_HOURS    = 100  # 연간 최대 발동시간 (시간)
+        # =====================================================================
+
+        # DR 발전기 p_max_pu 설정: 각 지역 전력수요 상위 5% 시점에만 1, 나머지 0
+        try:
+            dr_generators = [
+                g for g in network.generators.index
+                if str(network.generators.at[g, 'carrier']).upper() == 'DR'
+            ]
+            if dr_generators:
+                print(f"\n=== DR 발전기 p_max_pu 설정 (상위 {100 - DR_PEAK_PERCENTILE}% 피크 조건) ===")
+                region_codes = [
+                    'SEL', 'BSN', 'DGU', 'ICN', 'GWJ', 'DJN', 'USN', 'SJG',
+                    'GGD', 'GWD', 'CBD', 'CND', 'JBD', 'JND', 'GBD', 'GND', 'JJD'
+                ]
+                for dr_name in dr_generators:
+                    # 지역코드 추출: 버스 속성 우선, 발전기 이름 폴백
+                    bus_attr = str(network.generators.at[dr_name, 'bus'])
+                    region = None
+                    # 1순위: 버스명에서 추출 (예: GGD_EL → GGD)
+                    for code in region_codes:
+                        if bus_attr.startswith(code + '_') or bus_attr == code:
+                            region = code
+                            break
+                    # 2순위: 발전기 이름에서 추출 (폴백)
+                    if region is None:
+                        for code in region_codes:
+                            if dr_name.startswith(code + '_') or dr_name == code:
+                                region = code
+                                break
+
+                    if region is None:
+                        print(f"  [경고] {dr_name} (bus={bus_attr}): 지역코드 추출 실패 → p_max_pu=1 적용")
+                        network.generators_t.p_max_pu[dr_name] = pd.Series(1.0, index=network.snapshots)
+                        continue
+
+                    # 해당 지역 전력버스 부하 시계열 합산
+                    el_bus = f"{region}_EL"
+                    regional_load = pd.Series(0.0, index=network.snapshots)
+                    try:
+                        if (not network.loads.empty
+                                and hasattr(network.loads_t, 'p_set')
+                                and not network.loads_t.p_set.empty):
+                            load_names = network.loads.index[
+                                network.loads.bus.astype(str) == el_bus
+                            ]
+                            for ln in load_names:
+                                if ln in network.loads_t.p_set.columns:
+                                    regional_load = regional_load.add(
+                                        network.loads_t.p_set[ln].fillna(0.0),
+                                        fill_value=0.0
+                                    )
+                    except Exception as _e_load:
+                        print(f"  [경고] {dr_name}: 부하 시계열 읽기 실패 ({_e_load}) → p_max_pu=1 적용")
+                        network.generators_t.p_max_pu[dr_name] = pd.Series(1.0, index=network.snapshots)
+                        continue
+
+                    if regional_load.sum() <= 0:
+                        print(f"  [경고] {dr_name}: {region} 전력부하 없음 → p_max_pu=1 적용")
+                        network.generators_t.p_max_pu[dr_name] = pd.Series(1.0, index=network.snapshots)
+                        continue
+
+                    # 상위 5% 임계값 계산 후 p_max_pu 설정
+                    threshold = float(np.percentile(regional_load.values, DR_PEAK_PERCENTILE))
+                    peak_mask = (regional_load >= threshold).astype(float)
+                    peak_hours = int(peak_mask.sum())
+                    network.generators_t.p_max_pu[dr_name] = peak_mask
+                    p_nom_dr = float(network.generators.at[dr_name, 'p_nom'])
+                    print(f"  DR {dr_name}: 임계값={threshold:.1f} MW, "
+                          f"발동가능={peak_hours}h/년, 용량={p_nom_dr:.0f} MW")
+            else:
+                print("\n[DR] DR 발전기 없음 - DR 설정 건너뜀")
+        except Exception as _e_dr_setup:
+            print(f"DR p_max_pu 설정 경고: {_e_dr_setup}")
+
+        # DR 연간 발동시간 제한 extra_functionality 정의
+        def _dr_annual_hours_constraint(n, sns):
+            """DR 발전기 연간 발동 에너지 = p_nom × DR_ANNUAL_HOURS 이하 제약"""
+            try:
+                dr_gens_active = [
+                    g for g in n.generators.index
+                    if str(n.generators.at[g, 'carrier']).upper() == 'DR'
+                    and g in n.model.variables['Generator-p'].coords['Generator'].values
+                ]
+                if not dr_gens_active:
+                    return
+                weights = n.snapshot_weightings['generators'].loc[sns]
+                for dr_name in dr_gens_active:
+                    p_nom_val = float(n.generators.at[dr_name, 'p_nom'])
+                    annual_limit_mwh = p_nom_val * DR_ANNUAL_HOURS
+                    p_dr = n.model.variables['Generator-p'].sel(
+                        Generator=dr_name, snapshot=sns
+                    )
+                    energy_sum = (p_dr * weights).sum('snapshot')
+                    n.model.add_constraints(
+                        energy_sum <= annual_limit_mwh,
+                        name=f"DR-annual-limit-{dr_name}"
+                    )
+                    print(f"  [DR 연간제약] {dr_name}: ≤ {p_nom_val:.0f}MW × {DR_ANNUAL_HOURS}h "
+                          f"= {annual_limit_mwh:.0f} MWh/년")
+            except Exception as _e_dr_c:
+                print(f"DR 연간제약 추가 경고: {_e_dr_c}")
+
         # RPS 제약조건 적용 (최적화 전 모델에 추가) - 임시 비활성화
         if False:  # hasattr(network, 'rps_constraints') and network.rps_constraints:
             print("\n[RE] RPS 제약조건을 모델에 추가 중...")
@@ -1989,7 +2400,11 @@ def optimize_network(network):
             sopts = variant['opts']
             print(f"\n[시도] CPLEX 방법: {vname}, 옵션: {sopts}")
             try:
-                status = network.optimize(solver_name='cplex', solver_options=sopts)
+                status = network.optimize(
+                    solver_name='cplex',
+                    solver_options=sopts,
+                    extra_functionality=_dr_annual_hours_constraint
+                )
                 print(f"→ 상태: {status}")
                 last_status = status
                 if isinstance(status, tuple):
@@ -2147,6 +2562,17 @@ def _classify_technology(gen_or_link_name):
         return '수소'
     if 'heat' in name:
         return '열'
+    # DR (수요반응) 인식
+    name_tokens = name.split('_')
+    if 'dr' in name_tokens:
+        return 'DR'
+    # 미인식 기술: 발전기 이름에서 기술 부분 추출 (첫 토큰=지역코드 제거)
+    # 예) GGD_DR → 'DR',  BSN_ESS → 'ESS',  ICN_Custom_Gen → 'Custom_Gen'
+    orig_tokens = str(gen_or_link_name).strip().split('_')
+    if len(orig_tokens) >= 2:
+        tech_tokens = [t for t in orig_tokens[1:] if t and not t.isdigit()]
+        if tech_tokens:
+            return '_'.join(tech_tokens)
     return '기타'
 
 def _map_final_energy_from_carrier(carrier_value):
@@ -2271,6 +2697,166 @@ def build_final_energy_supply_tables(network):
     if not by_region_df.empty:
         by_region_df = by_region_df.groupby(['region', 'final_energy', 'technology'], as_index=False)[['supply_MWh', 'emissions_tCO2']].sum()
     return total_df, by_region_df
+
+
+def build_regional_power_balance_table(network):
+    """지역별 전력수급 균형 테이블 생성
+    
+    반환 컬럼: 지역, 전력생산_MWh, 전력소비_MWh,
+               송전전력IN_MWh, 송전전력OUT_MWh,
+               재생에너지생산비중_%, Curtailment_MWh
+    """
+    import pandas as _pd
+    import numpy as _np
+
+    bus_to_carrier = network.buses.carrier.to_dict() if not network.buses.empty else {}
+
+    def _is_el_bus(bus_name):
+        carrier = str(bus_to_carrier.get(bus_name, '')).lower()
+        if ('electric' in carrier or carrier in ['el', 'ac', 'dc', 'hvac', 'hvdc']):
+            return True
+        b = str(bus_name).upper()
+        return b.endswith('_EL') or b == 'EL'
+
+    def _region_of(bus_name):
+        s = str(bus_name)
+        return s.split('_')[0] if '_' in s else s
+
+    # 전력 버스를 가진 지역 코드 수집
+    el_buses = [b for b in network.buses.index if _is_el_bus(b)]
+    region_codes = sorted({_region_of(b) for b in el_buses})
+
+    region_data = {r: {
+        'generation': 0.0,
+        're_generation': 0.0,
+        'consumption': 0.0,
+        'tx_in': 0.0,
+        'tx_out': 0.0,
+        'curtailment': 0.0,
+    } for r in region_codes}
+
+    # 1. 발전량 집계 (EL 버스에 연결된 발전기)
+    if (not network.generators.empty
+            and hasattr(network.generators_t, 'p')
+            and not network.generators_t.p.empty):
+        for gen in network.generators.index:
+            if gen not in network.generators_t.p.columns:
+                continue
+            bus = str(network.generators.at[gen, 'bus'])
+            if not _is_el_bus(bus):
+                continue
+            region = _region_of(bus)
+            if region not in region_data:
+                continue
+            gen_sum = float(_np.nansum(network.generators_t.p[gen].values))
+            if gen_sum <= 0:
+                continue
+            region_data[region]['generation'] += gen_sum
+            # 재생에너지 여부 (PV / WT)
+            gn = gen.lower()
+            if 'pv' in gn or 'solar' in gn or 'wt' in gn or 'wind' in gn:
+                region_data[region]['re_generation'] += gen_sum
+                # Curtailment 계산
+                if gen in network.generators_t.p_max_pu.columns:
+                    p_nom = float(network.generators.at[gen, 'p_nom'])
+                    potential = network.generators_t.p_max_pu[gen] * p_nom
+                    actual = network.generators_t.p[gen]
+                    curtailed = float((potential - actual).clip(lower=0).sum())
+                    region_data[region]['curtailment'] += curtailed
+
+    # 2. 소비량 집계 (EL 버스에 연결된 부하)
+    loads_p_df = None
+    try:
+        if hasattr(network.loads_t, 'p') and not network.loads_t.p.empty:
+            loads_p_df = network.loads_t.p
+        elif hasattr(network.loads_t, 'p_set') and not network.loads_t.p_set.empty:
+            loads_p_df = network.loads_t.p_set
+    except Exception:
+        pass
+
+    if loads_p_df is not None and not network.loads.empty:
+        for ld in network.loads.index:
+            if ld not in loads_p_df.columns:
+                continue
+            bus = str(network.loads.at[ld, 'bus'])
+            if not _is_el_bus(bus):
+                continue
+            region = _region_of(bus)
+            if region not in region_data:
+                continue
+            load_sum = float(_np.nansum(loads_p_df[ld].fillna(0).values))
+            region_data[region]['consumption'] += load_sum
+
+    # 3. AC 선로 조류 집계
+    # p0 > 0: bus0→bus1 흐름 (bus0 지역 OUT, bus1 지역 IN)
+    # p0 < 0: bus1→bus0 흐름 (bus1 지역 OUT, bus0 지역 IN)
+    if (not network.lines.empty
+            and hasattr(network.lines_t, 'p0')
+            and not network.lines_t.p0.empty):
+        for line in network.lines.index:
+            if line not in network.lines_t.p0.columns:
+                continue
+            bus0 = str(network.lines.at[line, 'bus0'])
+            bus1 = str(network.lines.at[line, 'bus1'])
+            if not (_is_el_bus(bus0) and _is_el_bus(bus1)):
+                continue
+            r0, r1 = _region_of(bus0), _region_of(bus1)
+            if r0 == r1:
+                continue
+            p0 = network.lines_t.p0[line]
+            # r0 기준
+            out_r0 = float(p0.clip(lower=0).sum())   # p0>0 → r0 내보냄
+            in_r0  = float((-p0).clip(lower=0).sum()) # p0<0 → r0 받음
+            if r0 in region_data:
+                region_data[r0]['tx_out'] += out_r0
+                region_data[r0]['tx_in']  += in_r0
+            if r1 in region_data:
+                region_data[r1]['tx_in']  += out_r0  # r0가 내보낸 만큼 r1이 받음
+                region_data[r1]['tx_out'] += in_r0   # r0가 받은 만큼 r1이 내보냄
+
+    # 4. DC 링크 조류 집계 (지역간 전력 링크만)
+    # p0 > 0: r0가 내보냄(OUT), r1이 받음(IN)
+    if (not network.links.empty
+            and hasattr(network.links_t, 'p0')
+            and not network.links_t.p0.empty):
+        for link in network.links.index:
+            if link not in network.links_t.p0.columns:
+                continue
+            bus0 = str(network.links.at[link, 'bus0'])
+            bus1 = str(network.links.at[link, 'bus1'])
+            if not (_is_el_bus(bus0) and _is_el_bus(bus1)):
+                continue
+            r0, r1 = _region_of(bus0), _region_of(bus1)
+            if r0 == r1:
+                continue
+            p0 = network.links_t.p0[link]
+            out_r0 = float(p0.clip(lower=0).sum())
+            in_r0  = float((-p0).clip(lower=0).sum())
+            if r0 in region_data:
+                region_data[r0]['tx_out'] += out_r0
+                region_data[r0]['tx_in']  += in_r0
+            if r1 in region_data:
+                region_data[r1]['tx_in']  += out_r0
+                region_data[r1]['tx_out'] += in_r0
+
+    # 결과 DataFrame 생성
+    rows = []
+    for region in sorted(region_data.keys()):
+        d = region_data[region]
+        gen = d['generation']
+        re_gen = d['re_generation']
+        re_ratio = round((re_gen / gen * 100), 2) if gen > 0 else 0.0
+        rows.append({
+            '지역': region,
+            '전력생산_MWh': round(gen, 1),
+            '전력소비_MWh': round(d['consumption'], 1),
+            '송전전력IN_MWh': round(d['tx_in'], 1),
+            '송전전력OUT_MWh': round(d['tx_out'], 1),
+            '재생에너지생산비중_%': re_ratio,
+            'Curtailment_MWh': round(d['curtailment'], 1),
+        })
+    return _pd.DataFrame(rows)
+
 
 # 국가 기준 시간별 수급표(전력/열/수소) 생성
 
@@ -2580,6 +3166,15 @@ def save_results(network, filename=None, subdir=None):
             except Exception as _e_fe:
                 print(f"최종에너지 공급 집계 시트 저장 경고: {_e_fe}")
 
+            # 지역별 전력수급 균형 시트 추가
+            try:
+                regional_balance_df = build_regional_power_balance_table(network)
+                if regional_balance_df is not None and not regional_balance_df.empty:
+                    regional_balance_df.to_excel(writer, sheet_name='Regional_PowerBalance', index=False)
+                    print(f"Regional_PowerBalance 시트 저장 완료: {len(regional_balance_df)}개 지역")
+            except Exception as _e_rpb:
+                print(f"지역별 전력수급 균형 시트 저장 경고: {_e_rpb}")
+
             # 국가 기준 시간별 수급표(전력/열/수소)
             try:
                 ts_el, ts_h, ts_h2 = _build_country_timeseries_tables(network)
@@ -2703,6 +3298,17 @@ def save_results(network, filename=None, subdir=None):
                 fe_by_region.to_csv(f'{results_dir}/optimization_result_{current_time}_final_energy_supply_by_region.csv', index=False)
         except Exception as _e2:
             print(f"최종에너지 공급 집계 CSV 저장 경고: {_e2}")
+
+        # 지역별 전력수급 균형 CSV
+        try:
+            regional_balance_df = build_regional_power_balance_table(network)
+            if regional_balance_df is not None and not regional_balance_df.empty:
+                regional_balance_df.to_csv(
+                    f'{results_dir}/optimization_result_{current_time}_regional_power_balance.csv',
+                    index=False, encoding='utf-8-sig'
+                )
+        except Exception as _e_rpb2:
+            print(f"지역별 전력수급 균형 CSV 저장 경고: {_e_rpb2}")
 
         # 3. 통계 정보 JSON 파일
         try:
@@ -3178,24 +3784,18 @@ def create_legacy_korea_map(network, results_dir, current_time):
         
         print("이전 버전 한국 지도 시각화 생성 중...")
         
-        # 한국 지역 좌표 정의 (간단한 버전)
+        # 한국 지역 좌표 정의 (11개 지역 - 흡수합병된 SEL/SJG/DJN/DGU/USN/GWJ 제외)
         region_coords = {
-            'SEL': (5, 7),    # 서울
             'ICN': (4, 7),    # 인천
             'GGD': (5, 6),    # 경기
             'GWD': (7, 8),    # 강원
             'CBD': (6, 5),    # 충북
             'CND': (4, 5),    # 충남
-            'DJN': (5, 4),    # 대전
-            'SJG': (5, 4.5),  # 세종
             'JBD': (3, 3),    # 전북
             'JND': (2, 2),    # 전남
-            'GWJ': (3, 2.5),  # 광주
             'GBD': (7, 4),    # 경북
-            'DGU': (7, 3),    # 대구
             'GND': (6, 2),    # 경남
             'BSN': (7, 1),    # 부산
-            'USN': (7.5, 1.5), # 울산
             'JJD': (1, 0)     # 제주
         }
         
