@@ -3622,6 +3622,12 @@ def save_results(network, filename=None, subdir=None):
         # 6. 시각화 결과 생성
         create_visualizations(network, results_dir, current_time)
 
+        # 7. 계절별 대표 구간 시각화 (5종 × 4계절)
+        try:
+            create_seasonal_analysis_charts(network, results, results_dir, current_time)
+        except Exception as _e_sea:
+            print(f"계절별 시각화 생성 경고: {_e_sea}")
+
         print(f"결과가 '{results_dir}' 폴더에 저장되었습니다.")
         print(f"- Excel 파일: {excel_filename}")
         print(f"- CSV 파일들: generator_output, load, storage, line_usage")
@@ -3635,6 +3641,447 @@ def save_results(network, filename=None, subdir=None):
         print(f"결과 저장 중 오류 발생: {str(e)}")
         traceback.print_exc()
         return False
+
+def create_seasonal_analysis_charts(network, results, results_dir, current_time):
+    """계절별 대표 168h 구간에 대해 5종 시각화 생성 및 저장.
+
+    저장 경로: results_dir/seasonal_analysis/{봄_Spring|여름_Summer|가을_Autumn|겨울_Winter}/
+    생성 파일: 01_dispatch_stack.png  ② 02_line_saturation_heatmap.png
+               ③ 03_sector_coupling_vs_congestion.png  ④ 04_storage_soc_price.png
+               ⑤ 05_energy_balance.png
+    """
+    if os.environ.get('DISABLE_PLOTS', '0') == '1':
+        return
+
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import numpy as np
+
+    # 한글 폰트
+    try:
+        import matplotlib as mpl
+        mpl.rcParams['font.family'] = ['Malgun Gothic', 'AppleGothic', 'DejaVu Sans']
+        mpl.rcParams['axes.unicode_minus'] = False
+    except Exception:
+        pass
+
+    snapshots = network.snapshots
+    bus_carrier = network.buses.carrier.to_dict() if not network.buses.empty else {}
+
+    def _is_el(bus_name):
+        c = str(bus_carrier.get(bus_name, '')).lower()
+        return ('electric' in c or c in ['el', 'ac', 'dc', 'hvac', 'hvdc']
+                or str(bus_name).upper().endswith('_EL'))
+
+    COAL_KW = ['당진', '영흥', '하동', '삼척', '태안', '보령', '삼천포', '호남', '동해',
+               '강릉안인', '북평', '신서천', '고성', '여수', '삼척그린파워']
+
+    STACK_ORDER = ['Nuclear', 'Coal', 'LNG', 'Hydro', 'CHP', 'WT', 'PV', 'DR', 'Other']
+    GEN_COLORS  = {
+        'Nuclear': '#8E44AD', 'Coal': '#555555', 'LNG': '#E67E22',
+        'Hydro':   '#3498DB', 'CHP': '#8D6E63',  'PV':  '#FFC107',
+        'WT':      '#4CAF50', 'DR':  '#E74C3C',   'Other': '#95A5A6',
+    }
+
+    def _classify_gen(name):
+        n = name.lower()
+        if 'pv' in n or 'solar' in n:            return 'PV'
+        if 'wt' in n or 'wind' in n:             return 'WT'
+        if 'nuclear' in n:                        return 'Nuclear'
+        if 'coal' in n or any(k in n for k in COAL_KW): return 'Coal'
+        if 'chp' in n:                            return 'CHP'
+        if 'lng' in n or 'gas' in n:              return 'LNG'
+        if 'hydro' in n or 'water' in n:          return 'Hydro'
+        if 'dr' in n.split('_'):                  return 'DR'
+        return 'Other'
+
+    def _get_gen_agg(idx):
+        agg = {k: np.zeros(len(idx)) for k in STACK_ORDER}
+        try:
+            if not network.generators.empty and hasattr(network.generators_t, 'p') and not network.generators_t.p.empty:
+                for gen in network.generators_t.p.columns:
+                    if gen not in network.generators.index:
+                        continue
+                    if not _is_el(str(network.generators.at[gen, 'bus'])):
+                        continue
+                    agg[_classify_gen(gen)] += network.generators_t.p[gen].reindex(idx).fillna(0).values
+        except Exception as _e:
+            print(f"    [gen_agg 경고] {_e}")
+        return {k: v for k, v in agg.items() if np.abs(v).max() > 0.1}
+
+    def _get_demand(idx):
+        demand = pd.Series(0.0, index=idx)
+        try:
+            ldf = pd.DataFrame()
+            if hasattr(network.loads_t, 'p') and not network.loads_t.p.empty:
+                ldf = network.loads_t.p
+            elif hasattr(network.loads_t, 'p_set') and not network.loads_t.p_set.empty:
+                ldf = network.loads_t.p_set
+            if not ldf.empty:
+                for ld in ldf.columns:
+                    bus = str(network.loads.at[ld, 'bus']) if ld in network.loads.index else ''
+                    if _is_el(bus):
+                        demand = demand.add(ldf[ld].reindex(idx).fillna(0), fill_value=0)
+        except Exception:
+            pass
+        return demand
+
+    def _get_season_window(months, n_hours=168):
+        """해당 월 범위에서 선로 포화 피크 시점을 중심으로 168h 시작 시점 반환"""
+        s_snaps = snapshots[[t.month in months for t in snapshots]]
+        if len(s_snaps) < n_hours:
+            return s_snaps[0] if len(s_snaps) > 0 else snapshots[0]
+        try:
+            if not network.lines.empty and hasattr(network.lines_t, 'p0') and not network.lines_t.p0.empty:
+                util_max = pd.Series(0.0, index=s_snaps)
+                for line in network.lines_t.p0.columns:
+                    if line in network.lines.index:
+                        s_nom = float(network.lines.at[line, 's_nom'])
+                        if s_nom > 0:
+                            p = network.lines_t.p0[line].reindex(s_snaps).fillna(0)
+                            util_max = util_max.combine(p.abs() / s_nom, max)
+                peak_ts  = util_max.idxmax()
+                peak_loc = list(s_snaps).index(peak_ts)
+                start_loc = max(0, peak_loc - n_hours // 4)
+                return s_snaps[start_loc]
+        except Exception:
+            pass
+        return s_snaps[0]
+
+    # ── ① Dispatch Stack ────────────────────────────────────────
+    def _plot01_dispatch_stack(idx, out_dir, s_name):
+        gen_agg = _get_gen_agg(idx)
+        demand  = _get_demand(idx)
+        if not gen_agg:
+            print(f"    발전 데이터 없음 – dispatch_stack 생략")
+            return
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 11), sharex=True,
+                                        gridspec_kw={'height_ratios': [4, 1], 'hspace': 0.04})
+        x      = np.arange(len(idx))
+        bottom = np.zeros(len(idx))
+        handles = []
+
+        for key in STACK_ORDER:
+            if key not in gen_agg:
+                continue
+            v = gen_agg[key]
+            ax1.fill_between(x, bottom, bottom + v, alpha=0.85,
+                             color=GEN_COLORS[key], linewidth=0.3)
+            handles.append(mpatches.Patch(color=GEN_COLORS[key], label=key))
+            bottom += v
+
+        ax1.plot(x, demand.values, 'k-', lw=2.0, zorder=10, label='전력수요')
+        handles.append(plt.Line2D([0], [0], color='k', lw=2, label='전력수요'))
+
+        # RE Curtailment 하단 패널
+        curt_total = pd.Series(0.0, index=idx)
+        if results and 're_curtailment' in results:
+            for data in results['re_curtailment'].values():
+                ts = data.get('timeseries')
+                if ts is not None:
+                    curt_total = curt_total.add(ts.reindex(idx).fillna(0), fill_value=0)
+        ax2.fill_between(x, 0, curt_total.values, color='red', alpha=0.6)
+        ax2.set_ylabel('Curtailment\n(MWh)', fontsize=9)
+        ax2.grid(True, alpha=0.3)
+
+        tick_pos = list(range(0, len(idx), 24))
+        tick_lbl = [idx[i].strftime('%m/%d\n%H:00') for i in tick_pos]
+        ax2.set_xticks(tick_pos)
+        ax2.set_xticklabels(tick_lbl, fontsize=8)
+        ax1.set_ylabel('출력 (MW)', fontsize=11)
+        ax1.legend(handles=handles, loc='upper right', ncol=4, fontsize=9)
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xlim(0, len(idx) - 1)
+        ax1.set_title(f'[{s_name}] 발전원별 누적 출력 및 수요', fontsize=13, fontweight='bold')
+        plt.savefig(f'{out_dir}/01_dispatch_stack.png', dpi=200, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    → 01_dispatch_stack.png")
+
+    # ── ② 선로 포화 히트맵 ────────────────────────────────────────
+    def _plot02_line_heatmap(idx, out_dir, s_name):
+        if network.lines.empty or not hasattr(network.lines_t, 'p0') or network.lines_t.p0.empty:
+            print(f"    선로 데이터 없음 – heatmap 생략")
+            return
+
+        util_data = {}
+        for line in network.lines_t.p0.columns:
+            if line in network.lines.index:
+                s_nom = float(network.lines.at[line, 's_nom'])
+                if s_nom > 0:
+                    p = network.lines_t.p0[line].reindex(idx).fillna(0)
+                    u = (p.abs() / s_nom * 100).values
+                    if u.max() > 0.1:
+                        util_data[line] = u
+        if not util_data:
+            return
+
+        top_n = 30
+        sorted_lines = sorted(util_data, key=lambda l: util_data[l].max(), reverse=True)[:top_n]
+        matrix = np.array([util_data[l] for l in sorted_lines])
+
+        fig_h = max(5, len(sorted_lines) * 0.38 + 2)
+        fig, ax = plt.subplots(figsize=(20, fig_h))
+        im = ax.pcolormesh(np.arange(len(idx) + 1), np.arange(len(sorted_lines) + 1),
+                           matrix, cmap='RdYlGn_r', vmin=0, vmax=100)
+        plt.colorbar(im, ax=ax, label='포화율 (%)', pad=0.01)
+
+        ax.set_yticks(np.arange(len(sorted_lines)) + 0.5)
+        ax.set_yticklabels(sorted_lines, fontsize=7)
+
+        tick_pos = list(range(0, len(idx), 24))
+        ax.set_xticks([t + 0.5 for t in tick_pos])
+        ax.set_xticklabels([idx[i].strftime('%m/%d') for i in tick_pos], fontsize=9)
+
+        # 포화율 ≥95% 셀 강조
+        for yi, line in enumerate(sorted_lines):
+            for xi, val in enumerate(util_data[line]):
+                if val >= 95:
+                    ax.add_patch(plt.Rectangle((xi, yi), 1, 1, fill=False,
+                                               edgecolor='darkred', lw=1.2))
+        ax.set_title(f'[{s_name}] 송전선로 시간대별 포화율 히트맵 (상위 {len(sorted_lines)}개)',
+                     fontsize=12, fontweight='bold')
+        ax.set_xlabel('시간 →', fontsize=10)
+        plt.tight_layout()
+        plt.savefig(f'{out_dir}/02_line_saturation_heatmap.png', dpi=180,
+                    bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    → 02_line_saturation_heatmap.png")
+
+    # ── ③ 섹터커플링 vs 선로포화 ──────────────────────────────────
+    def _plot03_sector_coupling(idx, out_dir, s_name):
+        max_util = pd.Series(0.0, index=idx)
+        if not network.lines.empty and hasattr(network.lines_t, 'p0') and not network.lines_t.p0.empty:
+            for line in network.lines_t.p0.columns:
+                if line in network.lines.index:
+                    s_nom = float(network.lines.at[line, 's_nom'])
+                    if s_nom > 0:
+                        p = network.lines_t.p0[line].reindex(idx).fillna(0)
+                        max_util = max_util.combine(p.abs() / s_nom * 100, max)
+
+        link_flows = {}
+        if not network.links.empty and hasattr(network.links_t, 'p0') and not network.links_t.p0.empty:
+            for link in network.links_t.p0.columns:
+                p = network.links_t.p0[link].reindex(idx).fillna(0)
+                if p.abs().max() > 0.1:
+                    link_flows[link] = p.values
+
+        if max_util.max() < 0.1 and not link_flows:
+            print(f"    선로/링크 데이터 없음 – sector_coupling 생략")
+            return
+
+        x = np.arange(len(idx))
+        fig, ax1 = plt.subplots(figsize=(18, 7))
+
+        ax1.fill_between(x, 0, max_util.values, alpha=0.20, color='#D32F2F')
+        ax1.plot(x, max_util.values, color='#D32F2F', lw=1.8, alpha=0.9, label='최대 선로 포화율(%)')
+        ax1.axhline(80, color='#D32F2F', ls='--', lw=0.9, alpha=0.7, label='포화 임계값(80%)')
+        ax1.set_ylabel('최대 선로 포화율 (%)', color='#D32F2F', fontsize=11)
+        ax1.tick_params(axis='y', labelcolor='#D32F2F')
+        ax1.set_ylim(0, max(max_util.max() * 1.25, 15))
+
+        ax2 = ax1.twinx()
+        colors_link = plt.cm.tab10(np.linspace(0, 1, max(len(link_flows), 1)))
+        for i, (lname, lvals) in enumerate(link_flows.items()):
+            ax2.plot(x, lvals, lw=1.5, color=colors_link[i], alpha=0.85, label=lname)
+        ax2.set_ylabel('링크 조류 (MW)', color='#1565C0', fontsize=11)
+        ax2.tick_params(axis='y', labelcolor='#1565C0')
+
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc='upper left', fontsize=8, ncol=2)
+
+        tick_pos = list(range(0, len(idx), 24))
+        ax1.set_xticks(tick_pos)
+        ax1.set_xticklabels([idx[i].strftime('%m/%d\n%H:00') for i in tick_pos], fontsize=9)
+        ax1.set_xlim(0, len(idx) - 1)
+        ax1.grid(True, alpha=0.2)
+        ax1.set_title(f'[{s_name}] 선로 포화율 vs 유연성자원/섹터커플링 운영현황',
+                      fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(f'{out_dir}/03_sector_coupling_vs_congestion.png', dpi=200,
+                    bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    → 03_sector_coupling_vs_congestion.png")
+
+    # ── ④ 저장설비 SoC + 한계가격 ────────────────────────────────
+    def _plot04_storage_price(idx, out_dir, s_name):
+        soc_data   = {}
+        price_data = pd.Series(dtype=float)
+
+        try:
+            if hasattr(network, 'stores_t'):
+                if hasattr(network.stores_t, 'e') and network.stores_t.e is not None and not network.stores_t.e.empty:
+                    for s in network.stores_t.e.columns:
+                        e = network.stores_t.e[s].reindex(idx).ffill().fillna(0)
+                        if e.max() > 0.1:
+                            soc_data[s] = e.values
+        except Exception:
+            pass
+
+        try:
+            if hasattr(network.buses_t, 'marginal_price') and not network.buses_t.marginal_price.empty:
+                el_buses = [b for b in network.buses_t.marginal_price.columns if _is_el(b)]
+                if el_buses:
+                    price_data = network.buses_t.marginal_price[el_buses].reindex(idx).fillna(0).mean(axis=1)
+        except Exception:
+            pass
+
+        has_soc   = bool(soc_data)
+        has_price = len(price_data) > 0
+
+        if not has_soc and not has_price:
+            print(f"    저장설비/가격 데이터 없음 – storage_price 생략")
+            return
+
+        x = np.arange(len(idx))
+        fig, ax1 = plt.subplots(figsize=(18, 7))
+        legend_h = []
+
+        if has_soc:
+            colors_soc = plt.cm.Blues(np.linspace(0.45, 0.85, len(soc_data)))
+            ax1.set_ylabel('충전 상태 SoC (MWh)', color='#1565C0', fontsize=11)
+            ax1.tick_params(axis='y', labelcolor='#1565C0')
+            for i, (sname, svals) in enumerate(soc_data.items()):
+                ax1.fill_between(x, 0, svals, alpha=0.25, color=colors_soc[i])
+                lp = ax1.plot(x, svals, lw=1.8, color=colors_soc[i], label=f'{sname} SoC')
+                legend_h.append(lp[0])
+
+        if has_price:
+            ax2 = ax1.twinx()
+            ax2.plot(x, price_data.values, color='#C0392B', lw=1.5, alpha=0.85, label='평균 한계가격')
+            ax2.set_ylabel('한계가격 (원/MWh)', color='#C0392B', fontsize=11)
+            ax2.tick_params(axis='y', labelcolor='#C0392B')
+            h2, _ = ax2.get_legend_handles_labels()
+            legend_h += h2
+
+        tick_pos = list(range(0, len(idx), 24))
+        ax1.set_xticks(tick_pos)
+        ax1.set_xticklabels([idx[i].strftime('%m/%d\n%H:00') for i in tick_pos], fontsize=9)
+        ax1.set_xlim(0, len(idx) - 1)
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(legend_h, [h.get_label() for h in legend_h], loc='upper left', fontsize=9)
+        ax1.set_title(f'[{s_name}] 저장설비 SoC 및 전력 한계가격 동향',
+                      fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(f'{out_dir}/04_storage_soc_price.png', dpi=200,
+                    bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    → 04_storage_soc_price.png")
+
+    # ── ⑤ 에너지 수급 균형 (수평 바) ─────────────────────────────
+    def _plot05_energy_balance(idx, out_dir, s_name):
+        gen_agg  = _get_gen_agg(idx)
+        demand   = _get_demand(idx)
+        if not gen_agg:
+            print(f"    발전 데이터 없음 – energy_balance 생략")
+            return
+
+        supply_by_type = {k: float(np.sum(v)) / 1000 for k, v in gen_agg.items() if np.sum(v) > 0.1}
+        total_supply   = sum(supply_by_type.values())
+        total_demand   = float(demand.sum()) / 1000
+
+        sto_charge = sto_discharge = 0.0
+        try:
+            if hasattr(network, 'stores_t') and hasattr(network.stores_t, 'p') and not network.stores_t.p.empty:
+                p_all = network.stores_t.p.reindex(idx).fillna(0)
+                sto_charge    = float(p_all.clip(lower=0).sum().sum()) / 1000
+                sto_discharge = float((-p_all).clip(lower=0).sum().sum()) / 1000
+        except Exception:
+            pass
+
+        curt_mwh = 0.0
+        if results and 're_curtailment' in results:
+            for data in results['re_curtailment'].values():
+                ts = data.get('timeseries')
+                if ts is not None:
+                    curt_mwh += float(ts.reindex(idx).fillna(0).sum()) / 1000
+
+        supply_types = [k for k in STACK_ORDER if k in supply_by_type]
+        supply_vals  = [supply_by_type[k] for k in supply_types]
+        supply_cols  = [GEN_COLORS[k] for k in supply_types]
+
+        consume_lbl  = ['전력수요', '저장충전', 'RE커튼먼트']
+        consume_vals = [total_demand, sto_charge, curt_mwh]
+        consume_cols = ['#1565C0', '#FF9800', '#D32F2F']
+        filtered = [(l, v, c) for l, v, c in zip(consume_lbl, consume_vals, consume_cols) if v > 0.001]
+        if filtered:
+            consume_lbl, consume_vals, consume_cols = map(list, zip(*filtered))
+        else:
+            consume_lbl, consume_vals, consume_cols = ['전력수요'], [total_demand], ['#1565C0']
+
+        fig_h = max(5, max(len(supply_types), len(consume_lbl)) * 0.7 + 3)
+        fig, (ax_s, ax_c) = plt.subplots(1, 2, figsize=(18, fig_h))
+
+        bars_s = ax_s.barh(supply_types, supply_vals, color=supply_cols,
+                           edgecolor='white', linewidth=0.5)
+        ax_s.bar_label(bars_s, [f'{v:.1f} GWh' for v in supply_vals], padding=4, fontsize=9)
+        ax_s.set_xlabel('에너지 (GWh)', fontsize=10)
+        ax_s.set_title('공급 (발전원별)', fontsize=11, fontweight='bold')
+        ax_s.set_xlim(0, max(supply_vals) * 1.35 if supply_vals else 1)
+        ax_s.invert_xaxis()
+        ax_s.grid(axis='x', alpha=0.3)
+
+        bars_c = ax_c.barh(consume_lbl, consume_vals, color=consume_cols,
+                           edgecolor='white', linewidth=0.5)
+        ax_c.bar_label(bars_c, [f'{v:.1f} GWh' for v in consume_vals], padding=4, fontsize=9)
+        ax_c.set_xlabel('에너지 (GWh)', fontsize=10)
+        ax_c.set_title('소비 (용도별)', fontsize=11, fontweight='bold')
+        ax_c.set_xlim(0, max(consume_vals) * 1.35 if consume_vals else 1)
+        ax_c.grid(axis='x', alpha=0.3)
+
+        fig.text(0.5, 0.98,
+                 f'[{s_name}] 168h 에너지 수급 균형  |  발전: {total_supply:.1f} GWh  /  수요: {total_demand:.1f} GWh',
+                 ha='center', va='top', fontsize=12, fontweight='bold',
+                 bbox=dict(facecolor='#F0F0F0', edgecolor='gray', boxstyle='round,pad=0.4'))
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.savefig(f'{out_dir}/05_energy_balance.png', dpi=200,
+                    bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f"    → 05_energy_balance.png")
+
+    # ── 계절별 루프 ───────────────────────────────────────────────
+    SEASONS = [
+        {'key': '봄_Spring',   'months': [3, 4, 5],       'name': '봄(3~5월)'},
+        {'key': '여름_Summer', 'months': [6, 7, 8],       'name': '여름(6~8월)'},
+        {'key': '가을_Autumn', 'months': [9, 10, 11],     'name': '가을(9~11월)'},
+        {'key': '겨울_Winter', 'months': [11, 12, 1, 2],  'name': '겨울(11~2월)'},
+    ]
+
+    for season in SEASONS:
+        s_key, s_name, months = season['key'], season['name'], season['months']
+        print(f"\n[계절별 시각화] {s_name} ...")
+
+        start_ts = _get_season_window(months)
+        end_ts   = start_ts + pd.Timedelta(hours=168)
+        mask     = (snapshots >= start_ts) & (snapshots < end_ts)
+        idx      = snapshots[mask]
+
+        if len(idx) < 24:
+            print(f"  → {s_name}: 유효 데이터 부족 ({len(idx)}h) – 건너뜀")
+            continue
+
+        print(f"  대표 구간: {idx[0].strftime('%Y-%m-%d %H:%M')} ~ {idx[-1].strftime('%Y-%m-%d %H:%M')}  ({len(idx)}h)")
+
+        out_dir = f'{results_dir}/seasonal_analysis/{s_key}'
+        os.makedirs(out_dir, exist_ok=True)
+
+        for fn, label in [
+            (_plot01_dispatch_stack,  '① dispatch_stack'),
+            (_plot02_line_heatmap,    '② line_heatmap'),
+            (_plot03_sector_coupling, '③ sector_coupling'),
+            (_plot04_storage_price,   '④ storage_price'),
+            (_plot05_energy_balance,  '⑤ energy_balance'),
+        ]:
+            try:
+                fn(idx, out_dir, s_name)
+            except Exception as _e:
+                print(f"    {label} 오류: {_e}")
+
+    print(f"\n[계절별 시각화] 완료 → {results_dir}/seasonal_analysis/")
+
 
 def create_visualizations(network, results_dir, current_time):
     if os.environ.get('DISABLE_PLOTS','0') == '1':
