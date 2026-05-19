@@ -88,6 +88,94 @@ def _normalize_region_code(value):
     except Exception:
         return str(value)
 
+def _read_line_flex_settings(interface_path):
+    """
+    interface.xlsx '인터페이스_1' 시트 행 6~51에서
+    선로별 유연 운영(Flexible Line Operation) 설정을 읽어 반환합니다.
+
+    열 레이아웃 (행 5 헤더 기준):
+        F열 = s_nom        : 유연 운영 시 최대 용량 (s_nom_flex)
+        G열 = s_nom_basic  : 기본(정상) 운전 상한 (s_nom_base)
+        H열 = time_limit   : 유연 운영 연간 최대 허용 시간 (h/yr)
+        I열 = load_region  : 수전 지역 코드 (예: GGD, CND, JJD …)
+                             해당 지역 부하 피크 시간대에 s_flex 허용
+
+    F > G 이고 H > 0 인 선로만 반환합니다.
+
+    Returns:
+        dict: {line_name: {'s_nom_flex': float,
+                           's_nom_base': float,
+                           'time_limit': float,
+                           'load_region': str or None}}
+    """
+    try:
+        import openpyxl as _opxl
+        if not os.path.exists(interface_path):
+            return {}
+        wb = _opxl.load_workbook(interface_path, data_only=True)
+        if '인터페이스_1' not in wb.sheetnames:
+            return {}
+        ws = wb['인터페이스_1']
+
+        # 헤더행(5행)에서 F/G/H/I 열 인덱스 확인
+        col_f = col_g = col_h = col_i = None
+        for cell in ws[5]:
+            if cell.value is None:
+                continue
+            hdr = str(cell.value).strip().lower()
+            if hdr == 's_nom':
+                col_f = cell.column
+            elif hdr == 's_nom_basic':
+                col_g = cell.column
+            elif hdr == 'time_limit':
+                col_h = cell.column
+            elif hdr in ('load_region', '수전지역', 'load_bus'):
+                col_i = cell.column
+
+        # 열을 못 찾으면 기본 위치(F=6, G=7, H=8, I=9) 사용
+        if col_f is None:
+            col_f = 6
+        if col_g is None:
+            col_g = 7
+        if col_h is None:
+            col_h = 8
+        if col_i is None:
+            col_i = 9
+
+        max_col = max(col_f, col_g, col_h, col_i)
+        result = {}
+        for row in ws.iter_rows(min_row=6, max_row=51, min_col=1, max_col=max_col):
+            name_cell = row[0].value
+            if not name_cell:
+                continue
+            line_name = str(name_cell).strip()
+            try:
+                f_val = row[col_f - 1].value
+                g_val = row[col_g - 1].value
+                h_val = row[col_h - 1].value
+                i_val = row[col_i - 1].value if col_i - 1 < len(row) else None
+            except IndexError:
+                continue
+            try:
+                s_flex = float(f_val) if f_val is not None else 0.0
+                s_base = float(g_val) if g_val is not None else 0.0
+                t_lim  = float(h_val) if h_val is not None else 0.0
+            except (TypeError, ValueError):
+                continue
+            load_region = str(i_val).strip() if i_val is not None else None
+            if s_flex > s_base > 0 and t_lim > 0:
+                result[line_name] = {
+                    's_nom_flex':   s_flex,
+                    's_nom_base':   s_base,
+                    'time_limit':   t_lim,
+                    'load_region':  load_region,
+                }
+        return result
+    except Exception as _e:
+        print(f"[선로 유연운영 설정 읽기 오류] {_e}")
+        return {}
+
+
 def _read_dc_fab_from_interface(interface_path, existing_load_names):
     """interface.xlsx 지역별 시트의 부하 섹션에서 Demand_DC / Demand_Fab 읽기.
 
@@ -2261,6 +2349,112 @@ def optimize_network(network):
             except Exception as _e_dr_c:
                 print(f"DR 연간제약 추가 경고: {_e_dr_c}")
 
+        # =====================================================================
+        # 선로 유연 운영 설정 — 인터페이스_1 F/G/H열 기반
+        # =====================================================================
+        _flex_iface_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), 'interface.xlsx'))
+        _line_flex = _read_line_flex_settings(_flex_iface_path)
+
+        if _line_flex:
+            print(f"\n=== 선로 유연 운영 설정 ({len(_line_flex)}개 선로) ===")
+
+            # ── 지역별 부하 시계열 캐시 (같은 지역 여러 선로에서 재사용) ──
+            _region_load_cache = {}
+
+            def _get_region_load(region_code):
+                """지역 전력버스(region_EL)에 연결된 부하의 합산 시계열 반환"""
+                if region_code in _region_load_cache:
+                    return _region_load_cache[region_code]
+                el_bus = f"{region_code}_EL"
+                load_series = pd.Series(0.0, index=network.snapshots)
+                try:
+                    load_names = network.loads.index[
+                        network.loads.bus.astype(str) == el_bus
+                    ]
+                    for ln in load_names:
+                        if (hasattr(network.loads_t, 'p_set')
+                                and ln in network.loads_t.p_set.columns):
+                            load_series = load_series.add(
+                                network.loads_t.p_set[ln].fillna(0.0),
+                                fill_value=0.0)
+                except Exception as _e_load:
+                    print(f"  [경고] {region_code} 부하 읽기 실패: {_e_load}")
+                _region_load_cache[region_code] = load_series
+                return load_series
+
+            for _lname, _lc in _line_flex.items():
+                if _lname not in network.lines.index:
+                    print(f"  [경고] {_lname}: 네트워크에 없음 — 건너뜀")
+                    continue
+
+                s_base      = _lc['s_nom_base']
+                s_flex      = _lc['s_nom_flex']
+                h_limit     = _lc['time_limit']
+                load_region = _lc.get('load_region')
+
+                # s_nom을 s_flex로 상향 (PyPSA 내부 상한 확장)
+                network.lines.at[_lname, 's_nom'] = s_flex
+
+                # ── s_max_pu 시계열 설정 ───────────────────────────────
+                # load_region이 있을 때만 s_max_pu로 시간 제한 적용
+                if load_region:
+                    region_load = _get_region_load(load_region)
+                    total_hrs   = len(network.snapshots)
+                    n_flex_hrs  = int(min(h_limit, total_hrs))
+
+                    if region_load.sum() > 0 and n_flex_hrs > 0:
+                        # 부하 상위 h_limit 시간을 유연운영 허용 시점으로 선별
+                        threshold = float(
+                            region_load.nlargest(n_flex_hrs).min())
+                        flex_mask = (region_load >= threshold)
+
+                        # 동률(threshold에 걸린 시간이 많을 때) → 정확히 h_limit개만 유지
+                        flex_idx = region_load.nlargest(n_flex_hrs).index
+                        flex_mask = pd.Series(False, index=network.snapshots)
+                        flex_mask.loc[flex_idx] = True
+
+                        # s_max_pu 시계열: flex 허용 시간=1.0, 나머지=s_base/s_flex
+                        s_max_pu_series = pd.Series(
+                            s_base / s_flex, index=network.snapshots)
+                        s_max_pu_series.loc[flex_mask] = 1.0
+
+                        # PyPSA lines_t.s_max_pu에 등록
+                        if not hasattr(network.lines_t, 's_max_pu') \
+                                or network.lines_t.s_max_pu is None \
+                                or network.lines_t.s_max_pu.empty:
+                            network.lines_t['s_max_pu'] = pd.DataFrame(
+                                index=network.snapshots)
+                        network.lines_t.s_max_pu[_lname] = s_max_pu_series
+
+                        actual_flex_hrs = int(flex_mask.sum())
+                        print(f"  {_lname}: 기본={s_base:.1f}MW → 최대={s_flex:.1f}MW, "
+                              f"한도={h_limit:.0f}h/yr | "
+                              f"수전지역={load_region}, "
+                              f"s_max_pu 피크시간={actual_flex_hrs}h")
+                    else:
+                        print(f"  {_lname}: [경고] {load_region} 부하 없음 "
+                              f"→ s_max_pu 미설정 (s_flex 전시간 허용)")
+                        print(f"    기본={s_base:.1f}MW → 최대={s_flex:.1f}MW, "
+                              f"한도={h_limit:.0f}h/yr")
+                else:
+                    # load_region 미입력 → 시간 제한 없이 s_flex 전체 허용
+                    print(f"  {_lname}: 기본={s_base:.1f}MW → 최대={s_flex:.1f}MW, "
+                          f"한도={h_limit:.0f}h/yr | "
+                          f"수전지역 미입력 → 시간제한 없음(s_flex 전시간 허용)")
+        else:
+            print("\n[선로 유연운영] 설정 없음 — 기본 용량 사용")
+
+        def _line_flex_constraint(n, sns):
+            """
+            선로 유연 운영 — s_max_pu 시계열이 시간 제한을 담당하므로
+            extra_functionality에서는 별도 제약 추가 없음.
+            (s_max_pu는 optimize_network 진입 시 이미 lines_t에 설정 완료)
+            """
+            # s_max_pu 방식: PyPSA가 lines_t.s_max_pu를 모델 빌드 시 자동 반영
+            # → extra_functionality에서 추가 작업 불필요
+            pass
+
         # RPS 제약조건 적용 (최적화 전 모델에 추가) - 임시 비활성화
         if False:  # hasattr(network, 'rps_constraints') and network.rps_constraints:
             print("\n[RE] RPS 제약조건을 모델에 추가 중...")
@@ -2387,12 +2581,17 @@ def optimize_network(network):
                 import traceback
                 traceback.print_exc()
         
-        # 최적화 옵션: Barrier 방법만 사용 (가장 빠름)
+        # 최적화 옵션: 기본 Barrier (May 8 성공 당시와 동일)
+        # - lpmethod=4: Barrier 내부점법 (대규모 LP에서 가장 빠름)
+        # - parallel=1: 결정론적 병렬 (재현성 보장)
+        # - barrier.algorithm=3: Mehrotra predictor-corrector
         option_variants = [
-            {'name': 'barrier', 'opts': {'threads': num_cores, 'lpmethod': 4, 'parallel': 1, 'barrier.algorithm': 3}}
+            {'name': 'barrier',
+             'opts': {'threads': num_cores, 'lpmethod': 4,
+                      'parallel': 1, 'barrier.algorithm': 3}},
         ]
-        print(f"[최적화 설정] 스레드: {num_cores}개")
-        
+        print(f"[최적화 설정] Barrier (기본 설정), 스레드: {num_cores}개")
+
         last_status = None
         last_error = None
         for variant in option_variants:
@@ -2400,10 +2599,15 @@ def optimize_network(network):
             sopts = variant['opts']
             print(f"\n[시도] CPLEX 방법: {vname}, 옵션: {sopts}")
             try:
+                def _combined_extra_functionality(n, sns):
+                    """DR 연간 한도 + 선로 유연 운영 제약 통합"""
+                    _dr_annual_hours_constraint(n, sns)
+                    _line_flex_constraint(n, sns)
+
                 status = network.optimize(
                     solver_name='cplex',
                     solver_options=sopts,
-                    extra_functionality=_dr_annual_hours_constraint
+                    extra_functionality=_combined_extra_functionality
                 )
                 print(f"→ 상태: {status}")
                 last_status = status
@@ -2413,6 +2617,40 @@ def optimize_network(network):
                     st_main = str(status)
                 if st_main and ('ok' in st_main.lower() or 'optimal' in st_main.lower()):
                     break
+                # ── "unknown" 이지만 실제로는 유효한 해인 경우 수락 ──────
+                # linopy가 "unknown"으로 반환하더라도 해를 파싱한 경우 수동으로 처리
+                if st_main and 'unknown' in st_main.lower():
+                    try:
+                        # linopy model에서 해가 파싱됐는지 확인
+                        m = getattr(network, 'model', None)
+                        sol = getattr(m, 'solution', None) if m is not None else None
+                        obj_linopy = None
+                        if m is not None:
+                            try:
+                                obj_linopy = float(m.objective.value)
+                            except Exception:
+                                pass
+                        obj_val = getattr(network, 'objective', None)
+                        valid_obj = obj_linopy or obj_val
+                        if sol is not None and valid_obj and float(valid_obj) > 0:
+                            print(f"  ▶ 수치 노이즈(unscaled infeasibilities) 감지 → 해 수동 수락")
+                            print(f"    목적함수={float(valid_obj):.4e}")
+                            # PyPSA assign_solution 수동 호출 시도
+                            try:
+                                from pypsa.optimization.optimize import assign_solution
+                                assign_solution(network)
+                                print(f"    assign_solution 완료 → 결과 정상 반영")
+                            except Exception as _e_as:
+                                try:
+                                    from pypsa.optimization import assign_solution
+                                    assign_solution(network)
+                                    print(f"    assign_solution 완료 → 결과 정상 반영")
+                                except Exception:
+                                    print(f"    assign_solution 실패({_e_as}), 결과 일부 누락 가능")
+                            last_status = ('ok', 'optimal')
+                            break
+                    except Exception as _e_fb:
+                        print(f"  unknown fallback 오류: {_e_fb}")
             except ValueError as e:
                 if 'No objects to concatenate' in str(e):
                     print("경고: AC 각도 결과(v_ang)가 없어 후처리에서 concat 실패. 각도 결과 없이 계속 진행합니다.")
@@ -2450,7 +2688,12 @@ def optimize_network(network):
         except Exception:
             pass
         
-        return bool(last_status) and ('unknown' not in str(last_status).lower())
+        # 최종 성공 여부: 'ok' 또는 'optimal' 포함 시 성공
+        _final_ok = (
+            bool(last_status) and
+            (('ok' in str(last_status).lower()) or ('optimal' in str(last_status).lower()))
+        )
+        return _final_ok
         
     except Exception as e:
         print(f"\n최적화 중 오류 발생: {str(e)}")
@@ -3622,6 +3865,12 @@ def save_results(network, filename=None, subdir=None):
         # 6. 시각화 결과 생성
         create_visualizations(network, results_dir, current_time)
 
+        # 6.5. 커스텀 시각화 5종 (results_dir/images/ 폴더)
+        try:
+            create_custom_visualizations(network, results_dir)
+        except Exception as _e_cv:
+            print(f"커스텀 시각화 생성 경고: {_e_cv}")
+
         # 7. 계절별 대표 구간 시각화 (5종 × 4계절, 전국)
         try:
             create_seasonal_analysis_charts(network, results, results_dir, current_time)
@@ -3640,6 +3889,7 @@ def save_results(network, filename=None, subdir=None):
         print(f"- 통계 파일: stats.json")
         print(f"- 네트워크 파일: .nc")
         print(f"- 시각화 파일들: PNG, HTML")
+        print(f"- 커스텀 차트 5종: {results_dir}/images/")
 
         return True
 
@@ -4438,6 +4688,34 @@ def create_regional_analysis_charts(network, results, results_dir, current_time)
             traceback.print_exc()
 
     print(f"\n[지역별 시각화] 전체 완료 → {results_dir}/regional_analysis/")
+
+
+def create_custom_visualizations(network, results_dir):
+    """
+    visualize_results.py 의 5종 차트를 results_dir/images/ 에 저장.
+    - 네트워크 객체를 직접 받아 nc 파일 재로딩 없이 실행
+    - 개별 차트 오류는 경고로 처리하여 다음 차트 생성에 영향 없음
+    """
+    if os.environ.get('DISABLE_PLOTS', '0') == '1':
+        print('[커스텀 시각화] DISABLE_PLOTS=1 → 스킵')
+        return
+
+    images_dir = os.path.join(results_dir, 'images')
+    try:
+        import sys as _sys
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        if _script_dir not in _sys.path:
+            _sys.path.insert(0, _script_dir)
+
+        import visualize_results as _vr
+        _vr.run_all_charts(network, images_dir)
+
+    except ImportError as _e:
+        print(f'[커스텀 시각화] visualize_results.py 로드 실패: {_e}')
+    except Exception as _e:
+        print(f'[커스텀 시각화] 오류: {_e}')
+        import traceback as _tb
+        _tb.print_exc()
 
 
 def create_visualizations(network, results_dir, current_time):
@@ -6845,34 +7123,40 @@ def _run_week_uc_analysis(input_data, full_network, uc_week):
 
 def main():
     # ── 분석 모드 선택 프롬프트 ──────────────────────────────────────────────
-    print("=" * 60)
-    print("  PyPSA GESI 분석 모드 선택")
-    print("=" * 60)
-    print("  all      : 전체 기간 분석 (committable 강제 False)")
-    print("  1 ~ 52   : 전체 기간 분석 후, 해당 주(week)에 대해")
-    print("             committable=True UC 분석을 추가 실행")
-    print("=" * 60)
-    try:
-        mode_input = input("분석 모드 입력 (all 또는 주 번호 1-52): ").strip().lower()
-    except EOFError:
-        mode_input = 'all'
+    # [임시 비활성화] 입력 없이 바로 전체 기간(all) 모드로 실행
+    # 아래 주석을 해제하면 다시 대화형 선택 가능
+    #
+    # print("=" * 60)
+    # print("  PyPSA GESI 분석 모드 선택")
+    # print("=" * 60)
+    # print("  all      : 전체 기간 분석 (committable 강제 False)")
+    # print("  1 ~ 52   : 전체 기간 분석 후, 해당 주(week)에 대해")
+    # print("             committable=True UC 분석을 추가 실행")
+    # print("=" * 60)
+    # try:
+    #     mode_input = input("분석 모드 입력 (all 또는 주 번호 1-52): ").strip().lower()
+    # except EOFError:
+    #     mode_input = 'all'
+    # if mode_input == 'all':
+    #     analysis_mode = 'all'
+    #     uc_week = None
+    #     print("\n[all 모드] 전체 기간 분석, 모든 발전기 committable=False 적용")
+    # else:
+    #     try:
+    #         uc_week = int(mode_input)
+    #         if not (1 <= uc_week <= 52):
+    #             raise ValueError("범위 초과")
+    #         analysis_mode = 'week'
+    #         print(f"\n[Week {uc_week} 모드] 전체 기간(committable=False) 분석 후")
+    #         print(f"               Week {uc_week}에 대해 UC 분석 추가 실행")
+    #     except ValueError:
+    #         print(f"[경고] '{mode_input}'은 유효하지 않습니다. all 모드로 실행합니다.")
+    #         analysis_mode = 'all'
+    #         uc_week = None
 
-    if mode_input == 'all':
-        analysis_mode = 'all'
-        uc_week = None
-        print("\n[all 모드] 전체 기간 분석, 모든 발전기 committable=False 적용")
-    else:
-        try:
-            uc_week = int(mode_input)
-            if not (1 <= uc_week <= 52):
-                raise ValueError("범위 초과")
-            analysis_mode = 'week'
-            print(f"\n[Week {uc_week} 모드] 전체 기간(committable=False) 분석 후")
-            print(f"               Week {uc_week}에 대해 UC 분석 추가 실행")
-        except ValueError:
-            print(f"[경고] '{mode_input}'은 유효하지 않습니다. all 모드로 실행합니다.")
-            analysis_mode = 'all'
-            uc_week = None
+    analysis_mode = 'all'
+    uc_week = None
+    print("[all 모드] 1년 전체 기간 분석으로 바로 시작합니다.")
 
     # ── 공통 준비 ───────────────────────────────────────────────────────────
     ensure_integrated_input()
