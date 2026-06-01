@@ -6048,6 +6048,55 @@ def extract_capacity_carryover(network):
     return carry
 
 
+def save_capacity_snapshot(carry, year, snapshots_dir=None):
+    """연도 최적화 결과(설비 용량)를 JSON 파일로 저장.
+
+    Parameters
+    ----------
+    carry        : extract_capacity_carryover() 반환값
+    year         : 해당 연도 (정수)
+    snapshots_dir: 저장 폴더 (기본: results_longterm/_capacity_snapshots/)
+
+    Returns
+    -------
+    저장 파일 경로 (str)
+    """
+    import json as _json
+    if snapshots_dir is None:
+        snapshots_dir = os.path.join('results_longterm', '_capacity_snapshots')
+    os.makedirs(snapshots_dir, exist_ok=True)
+    fpath = os.path.join(snapshots_dir, f'capacity_{year}.json')
+    with open(fpath, 'w', encoding='utf-8') as f:
+        _json.dump(carry, f, ensure_ascii=False, indent=2)
+    print(f"[스냅샷 저장] {year}년 설비 용량 → {fpath}")
+    return fpath
+
+
+def load_capacity_snapshot(year, snapshots_dir=None):
+    """저장된 연도별 설비 용량 스냅샷 로드.
+
+    Parameters
+    ----------
+    year         : 로드할 연도 (정수)
+    snapshots_dir: 저장 폴더 (기본: results_longterm/_capacity_snapshots/)
+
+    Returns
+    -------
+    carry dict, 또는 파일이 없으면 None
+    """
+    import json as _json
+    if snapshots_dir is None:
+        snapshots_dir = os.path.join('results_longterm', '_capacity_snapshots')
+    fpath = os.path.join(snapshots_dir, f'capacity_{year}.json')
+    if not os.path.exists(fpath):
+        print(f"[스냅샷 없음] {year}년 스냅샷 파일 없음: {fpath}")
+        return None
+    with open(fpath, 'r', encoding='utf-8') as f:
+        carry = _json.load(f)
+    print(f"[스냅샷 로드] {year}년 설비 용량 ← {fpath}")
+    return carry
+
+
 def apply_carryover_to_input(input_data, carryover_caps, policy='min'):
     """인계 용량을 입력 데이터에 반영
     policy='min': 다음 해 최소 용량 하한으로 적용(추가 확장 허용)
@@ -6778,6 +6827,12 @@ def _build_generator_overrides_for_year_v2(input_data, year, interface_path):
 
 
 def build_overrides_for_years(years, base_input_file):
+    """연도별 오버라이드 딕셔너리 구성.
+
+    각 연도에 대해:
+    - timeseries: 해당 연도 1월 1일 ~ 다음 해 1월 1일 (대표 1년)
+    - generators: interface.xlsx '시나리오_발전기' 시트에 정의된 용량 반영
+    """
     try:
         root_dir = os.path.dirname(__file__)
         interface_path = os.path.abspath(os.path.join(root_dir, 'interface.xlsx'))
@@ -6792,24 +6847,24 @@ def build_overrides_for_years(years, base_input_file):
         for y in years:
             ts_override = {
                 'start_time': f"{y}-01-01 00:00:00",
-                'end_time': f"{y+1}-01-01 00:00:00",
-                'frequency': freq
+                'end_time':   f"{y+1}-01-01 00:00:00",
+                'frequency':  freq
             }
-                    # 이름별 목표용량을 가져와 개별 발전기에 직접 주입
-        name_to_target = _parse_generator_scenario_from_interface(interface_path, y)
-        ov = {'timeseries': ts_override, 'generators': {}}
-        if name_to_target:
-            for gname, target in name_to_target.items():
-                # 재생 여부에 따라 최소용량만 지정(확장가능 여부는 입력 파일/인터페이스에 따름)
-                if any(k in gname for k in ['PV','WT']):
-                    ov['generators'][gname] = {'p_nom_min': float(target), 'p_nom': float(target)}
-                else:
-                    ov['generators'][gname] = {'p_nom': float(target)}
-        overrides_by_year[y] = ov
-        print(f"지정 연도 오버라이드 구성 완료: {list(overrides_by_year.keys())}")
+            # 이름별 목표 용량(interface.xlsx '시나리오_발전기' 시트) 반영
+            name_to_target = _parse_generator_scenario_from_interface(interface_path, y)
+            ov = {'timeseries': ts_override, 'generators': {}}
+            if name_to_target:
+                for gname, target in name_to_target.items():
+                    # 재생에너지: 최소 용량 설정(확장 가능 여부는 입력 파일에 따름)
+                    if any(k in gname for k in ['PV', 'WT']):
+                        ov['generators'][gname] = {'p_nom_min': float(target), 'p_nom': float(target)}
+                    else:
+                        ov['generators'][gname] = {'p_nom': float(target)}
+            overrides_by_year[y] = ov
+        print(f"연도별 오버라이드 구성 완료: {list(overrides_by_year.keys())}")
         return overrides_by_year
     except Exception as e:
-        print(f"지정 연도 오버라이드 구성 오류: {str(e)}")
+        print(f"연도별 오버라이드 구성 오류: {str(e)}")
         return {}
 
 def _parse_demand_scenario_wide(interface_path):
