@@ -1,335 +1,191 @@
-# GESI Annual Report 데이터베이스 시스템
+# PyPSA-GESI: 한국 에너지 시스템 최적화 모델
 
-**녹색에너지전략연구소(GESI)** 홈페이지와 연동하여 연간 보고서 작성을 위한 데이터를 자동으로 수집하고 관리하는 시스템입니다.
-
-## ✨ 주요 특징
-
-- 🔄 **자동 데이터 수집**: GESI 홈페이지에서 신규 콘텐츠 자동 수집
-- 🚫 **중복 방지**: 해시 기반 중복 검사로 신규 항목만 추가
-- 📊 **데이터베이스 관리**: SQLite 기반 체계적인 데이터 관리
-- 📈 **Annual Report 생성**: 연도별 데이터 집계 및 Excel 파일 자동 생성
-- ⏰ **정기 실행 지원**: 스케줄러 연동으로 자동화 가능
-
-## 📦 파일 구성
-
-```
-├── gesi_annual_report_system.py      # 메인 시스템 코드
-├── demo_gesi_system.py               # 데모/테스트 스크립트
-├── analyze_gesi_website.py           # 웹사이트 구조 분석 도구
-├── requirements_annual_report.txt    # 필수 패키지 목록
-├── run_gesi_collector.bat            # Windows 실행 배치 파일
-├── GESI_Annual_Report_사용가이드.md  # 상세 사용 가이드
-└── README_GESI_Annual_Report.md      # 이 파일
-```
-
-## 🚀 빠른 시작
-
-### 1단계: 패키지 설치
-
-```bash
-pip install -r requirements_annual_report.txt
-```
-
-### 2단계: 실행
-
-**방법 1: 배치 파일 실행 (Windows)**
-```bash
-run_gesi_collector.bat
-```
-
-**방법 2: Python 직접 실행**
-```bash
-python gesi_annual_report_system.py
-```
-
-**방법 3: 데모 실행 (기능 테스트)**
-```bash
-python demo_gesi_system.py
-```
-
-### 3단계: 결과 확인
-
-- **데이터베이스**: `gesi_annual_report.db`
-- **Excel 파일**: `annual_reports/GESI_Annual_Report_2024.xlsx`
-
-## 💡 사용 예시
-
-### 예시 1: 전체 데이터 수집
-
-```python
-from gesi_annual_report_system import GESIAnnualReportCollector
-
-collector = GESIAnnualReportCollector(headless=True)
-
-try:
-    # 모든 데이터 수집 (Library 5페이지까지)
-    results = collector.update_all(max_library_pages=5)
-    
-    # 결과 확인
-    print(f"보고서: {results['library']['new']}/{results['library']['total']} 신규")
-    print(f"프로젝트: {results['projects']['new']}/{results['projects']['total']} 신규")
-    print(f"이벤트: {results['events']['new']}/{results['events']['total']} 신규")
-    
-finally:
-    collector.close()
-```
-
-### 예시 2: 특정 연도 Annual Report 생성
-
-```python
-from gesi_annual_report_system import GESIAnnualReportCollector
-
-collector = GESIAnnualReportCollector(headless=True)
-
-try:
-    # 2024년 보고서 생성
-    collector.export_to_excel(year=2024, output_dir="reports_2024")
-    
-    # 2023년 보고서 생성
-    collector.export_to_excel(year=2023, output_dir="reports_2023")
-    
-finally:
-    collector.close()
-```
-
-### 예시 3: 데이터 조회
-
-```python
-from gesi_annual_report_system import GESIDatabase
-
-db = GESIDatabase()
-
-try:
-    # 2024년 보고서 조회
-    reports_2024 = db.get_library(year=2024)
-    print(f"2024년 발간물: {len(reports_2024)}건")
-    
-    # 카테고리별 조회
-    research_reports = db.get_library(category="연구보고서")
-    print(f"연구보고서: {len(research_reports)}건")
-    
-    # 진행중인 프로젝트 조회
-    ongoing_projects = db.get_projects(status="진행중")
-    print(f"진행중인 프로젝트: {len(ongoing_projects)}건")
-    
-finally:
-    db.close()
-```
-
-## 📊 수집되는 데이터
-
-### 1. Library (보고서/발간물)
-- 보고서 번호, 카테고리, 제목
-- 저자, 발간일, 조회수
-- 상세 페이지 URL
-
-### 2. Projects (프로젝트/과제)
-- 프로젝트명, 과제 코드
-- 연도, 상태 (진행중/완료)
-- 설명, 예산, 연구자 정보
-
-### 3. Events (행사/이벤트)
-- 행사명, 행사 유형
-- 날짜, 장소
-- 설명, 주최자
-
-## 🔧 시스템 구조
-
-```
-┌─────────────────────────────────────────────────┐
-│           GESI Annual Report System             │
-└─────────────────────────────────────────────────┘
-                        │
-        ┌───────────────┼───────────────┐
-        │               │               │
-┌───────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐
-│  Web Scraper │ │  Database  │ │   Excel    │
-│  (Selenium)  │ │  (SQLite)  │ │  Export    │
-└──────────────┘ └────────────┘ └────────────┘
-        │               │               │
-┌───────▼──────────────┐│               │
-│  https://gesi.kr     ││               │
-│  ├─ /library         ││               │
-│  ├─ /projects        ││               │
-│  └─ /EVENTS          ││               │
-└──────────────────────┘│               │
-                        │               │
-                ┌───────▼───────┐       │
-                │  .db 파일     │       │
-                │  ├─ library   │       │
-                │  ├─ projects  │       │
-                │  ├─ events    │       │
-                │  └─ history   │       │
-                └───────────────┘       │
-                                        │
-                                ┌───────▼────────┐
-                                │  .xlsx 파일    │
-                                │  ├─ 요약       │
-                                │  ├─ 발간물     │
-                                │  ├─ 프로젝트   │
-                                │  └─ 행사       │
-                                └────────────────┘
-```
-
-## 🔄 자동화 설정
-
-### Windows 작업 스케줄러
-
-1. **작업 스케줄러 실행**: `taskschd.msc`
-2. **작업 만들기**:
-   - 이름: "GESI 데이터 수집"
-   - 트리거: 매일 오전 9시
-   - 동작: `run_gesi_collector.bat` 실행
-   - 시작 위치: 프로젝트 폴더
-
-### Python 스케줄러 (schedule 라이브러리)
-
-```python
-import schedule
-import time
-
-def collect_data():
-    from gesi_annual_report_system import GESIAnnualReportCollector
-    collector = GESIAnnualReportCollector(headless=True)
-    try:
-        collector.update_all(max_library_pages=3)
-    finally:
-        collector.close()
-
-# 매일 오전 9시 실행
-schedule.every().day.at("09:00").do(collect_data)
-
-# 매주 월요일 실행
-schedule.every().monday.at("09:00").do(collect_data)
-
-while True:
-    schedule.run_pending()
-    time.sleep(60)
-```
-
-## 📋 데이터베이스 스키마
-
-### library (보고서)
-```sql
-CREATE TABLE library (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_hash TEXT UNIQUE NOT NULL,
-    no TEXT,
-    category TEXT,
-    title TEXT NOT NULL,
-    author TEXT,
-    published_date DATE,
-    views INTEGER,
-    url TEXT,
-    file_url TEXT,
-    summary TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-### projects (프로젝트)
-```sql
-CREATE TABLE projects (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_hash TEXT UNIQUE NOT NULL,
-    project_name TEXT NOT NULL,
-    project_code TEXT,
-    year TEXT,
-    start_date DATE,
-    end_date DATE,
-    status TEXT,
-    project_type TEXT,
-    funding_agency TEXT,
-    principal_investigator TEXT,
-    description TEXT,
-    budget TEXT,
-    url TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-### events (행사)
-```sql
-CREATE TABLE events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_hash TEXT UNIQUE NOT NULL,
-    event_name TEXT NOT NULL,
-    event_type TEXT,
-    event_date DATE,
-    location TEXT,
-    description TEXT,
-    organizer TEXT,
-    participants TEXT,
-    url TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-## ⚠️ 문제 해결
-
-### ChromeDriver 오류
-```
-❌ Chrome WebDriver 초기화 실패
-```
-
-**해결:**
-```bash
-pip install webdriver-manager
-```
-
-### Selenium이 데이터를 찾지 못함
-
-**해결:**
-1. `headless=False`로 브라우저 확인
-2. GESI 웹사이트 구조 변경 가능성 확인
-3. `analyze_gesi_website.py` 실행하여 구조 재분석
-
-### 패키지 설치 오류
-
-**해결:**
-```bash
-pip install --upgrade pip
-pip install -r requirements_annual_report.txt --upgrade
-```
-
-## 📚 참고 문서
-
-- **상세 사용 가이드**: `GESI_Annual_Report_사용가이드.md`
-- **웹사이트 분석 도구**: `analyze_gesi_website.py`
-- **데모 스크립트**: `demo_gesi_system.py`
-
-## 🔐 보안 및 윤리
-
-- 이 시스템은 **공개된 웹사이트**에서만 데이터를 수집합니다
-- **적절한 딜레이**(2초)를 두어 서버 부하를 최소화합니다
-- 개인정보는 수집하지 않습니다
-- 수집된 데이터는 연구소 내부 용도로만 사용됩니다
-
-## 🛠️ 기술 스택
-
-- **Python 3.8+**
-- **Selenium**: 동적 웹 페이지 스크래핑
-- **SQLite**: 데이터베이스
-- **Pandas**: 데이터 처리 및 분석
-- **openpyxl**: Excel 파일 생성
-
-## 📝 라이센스
-
-이 코드는 GESI 연구소 내부 사용을 위해 작성되었습니다.
-
-## 📞 문의
-
-시스템 관련 문의:
-- **개발자**: [담당자 이름]
-- **이메일**: [이메일 주소]
-- **연구소**: 녹색에너지전략연구소 (https://gesi.kr)
+**녹색에너지전략연구소(GESI)** 에서 개발한 한국 전력·에너지 시스템 최적화 도구입니다.  
+[PyPSA(Python for Power System Analysis)](https://pypsa.org/) 프레임워크 기반으로, 17개 광역 지자체를 노드로 설정한 **전국 단위 멀티-섹터 에너지 시스템 모델**입니다.
 
 ---
 
-**버전**: 1.0.0  
-**최종 업데이트**: 2024-12-18  
-**개발**: Python 3.x
+## 주요 특징
 
+- **멀티-캐리어 에너지 모델링**: 전력(AC/DC), 열에너지, 수소, 전기차(EV) 부하를 동일 네트워크에서 통합 분석
+- **17개 광역 지자체 노드**: 서울(SEL), 부산(BSN), 대구(DGU), 인천(ICN), 광주(GWJ), 대전(DJN), 울산(USN), 세종(SJG), 경기(GGD), 강원(GWD), 충북(CBD), 충남(CND), 전북(JBD), 전남(JND), 경북(GBD), 경남(GND), 제주(JJD)
+- **송전망 모델링**: 지역 간 AC/DC 선로(HVDC 포함), 유연 운영(Flexible Line Operation) 기능
+- **시나리오 기반 장기 분석**: `interface.xlsx`에서 연도별 수요·발전설비 시나리오를 정의하여 다년도 순차 최적화 실행
+- **Unit Commitment(UC) 분석**: 석탄·가스 발전기의 주 단위 UC 분석 지원
+- **풍부한 결과 시각화**: 지역별·계절별 발전량 스택, 송전 포화도 히트맵, 재생에너지 지도, 한국 지도 기반 시각화
+
+---
+
+## 모델 구조
+
+```
+PyPSA-GESI 모델
+├── 입력 데이터
+│   ├── integrated_input_data.xlsx   # 통합 입력 파일 (버스, 발전기, 선로, 수요 등)
+│   └── interface.xlsx               # 시나리오 설정 (연도별 수요·용량·가격 등)
+│
+├── 핵심 모듈 (PyPSA_GUI.py)
+│   ├── read_input_data()            # 엑셀 기반 입력 데이터 로드
+│   ├── create_network()             # PyPSA 네트워크 객체 생성
+│   ├── optimize_network()           # 선형/혼합정수 최적화 실행
+│   ├── save_results()               # 결과 저장 (Excel, CSV, NetCDF)
+│   ├── run_multi_year_sequence()    # 다년도 순차 시나리오 분석
+│   └── create_visualizations()     # 시각화 차트 생성
+│
+├── 보조 모듈 (modules/)
+│   ├── data_loader.py
+│   ├── network_builder.py
+│   ├── optimizer.py
+│   ├── result_processor.py
+│   └── visualization.py
+│
+└── 결과 (results/)
+    ├── *.xlsx                       # 지역별·발전원별 발전량, 송전 현황 등
+    ├── *.csv                        # 상세 시계열 데이터
+    ├── *.nc                         # PyPSA 네트워크 전체 결과 (NetCDF)
+    └── images/                      # 시각화 결과 이미지
+```
+
+---
+
+## 에너지 캐리어 구성
+
+| 캐리어 | 설명 | 포함 기술 |
+|--------|------|-----------|
+| `electricity` | 전력 (AC) | 석탄, LNG, 원자력, 태양광, 풍력, 수력, 양수 |
+| `DC` | 직류 송전 | HVDC 연계선 |
+| `heat` | 열에너지 | 열펌프(HP), CHP, 지역난방 |
+| `hydrogen` | 수소 | 전해조(Electrolyzer), 수소 연료전지 |
+| `EV` | 전기차 | V2G, 스마트 충전 부하 |
+
+---
+
+## 빠른 시작
+
+### 1. 환경 설정
+
+```bash
+conda create -n pypsa_env python=3.10
+conda activate pypsa_env
+pip install -r requirements.txt
+```
+
+> CPLEX 또는 Gurobi 솔버 사용 시 별도 라이선스 설치 필요 (기본: GLPK/HiGHS 무료 솔버 지원)
+
+### 2. 입력 데이터 준비
+
+- `integrated_input_data.xlsx`: 버스, 발전기, 선로, 저장장치, 부하, 시계열 패턴을 시트별로 정의
+- `interface.xlsx`: 연도별 에너지 수요 시나리오, 발전설비 용량 계획, 유연 선로 운영 설정
+
+### 3. 단일 연도 분석 실행
+
+```bash
+python PyPSA_GUI.py
+```
+
+### 4. 다년도 시나리오 분석
+
+```python
+from PyPSA_GUI import run_multi_year_sequence, build_overrides_for_years
+
+years = [2030, 2035, 2040, 2045, 2050]
+overrides = build_overrides_for_years(years, base_input_file='integrated_input_data.xlsx')
+
+results = run_multi_year_sequence(
+    years=years,
+    overrides_by_year=overrides,
+    carryover=True,              # 이전 연도 설비 용량 인계
+    results_root='results_multi'
+)
+```
+
+---
+
+## 주요 출력 결과
+
+### Excel / CSV
+| 파일명 패턴 | 내용 |
+|-------------|------|
+| `*_generator_output.csv` | 발전기별 시간별 발전량 |
+| `*_regional_power_balance.csv` | 지역별 수급 균형 |
+| `*_line_usage.csv` | 송전선로 흐름 및 포화도 |
+| `*_final_energy_supply.csv` | 최종에너지 공급량 (섹터별) |
+| `*_발전원별_발전량.csv` | 발전원별 연간 발전량 |
+| `*_지역별_발전원별_발전량.csv` | 지역×발전원 교차 분석 |
+| `*.xlsx` | 종합 분석 보고서 (다중 시트) |
+
+### 시각화
+| 차트 | 설명 |
+|------|------|
+| `viz_01_line_utilization` | 송전선로 활용률 분포 |
+| `viz_02_re_vs_tx` | 재생에너지 비중 vs 송전 혼잡도 |
+| `viz_03_seasonal_heatmap` | 계절별 시간대 발전량 히트맵 |
+| `viz_04_regional_balance` | 지역별 에너지 수급 균형 |
+| `viz_05_sector_coupling` | 섹터 커플링 현황 |
+| `regional_analysis/` | 지역×계절별 상세 분석 (5종 차트) |
+| `*_korea_transmission_map` | 한국 지도 기반 송전망 현황 |
+| `*_re_korea_map` | 한국 지도 기반 재생에너지 분포 |
+
+---
+
+## 시나리오 분석 구조
+
+`interface.xlsx`의 시트 구성:
+
+| 시트명 | 내용 |
+|--------|------|
+| `인터페이스_1` | 선로별 유연 운영 설정 (s_nom_flex, 연간 허용 시간 등) |
+| `시나리오_에너지수요` | 연도별·지역별·섹터별 에너지 수요 시나리오 |
+| 지역 코드 시트 (예: `GGD`, `CND` ...) | 지역별 발전기·링크·부하 설정 |
+| `load_patterns` | 지역별·섹터별 8760시간 부하 패턴 |
+| `renewable_patterns` | 지역별 태양광·풍력 발전량 패턴 |
+
+---
+
+## 기술 스택
+
+| 구분 | 사용 기술 |
+|------|-----------|
+| 최적화 프레임워크 | [PyPSA](https://pypsa.org/) >= 0.21 |
+| 솔버 | CPLEX / Gurobi / HiGHS (GLPK) |
+| 언어 | Python 3.10+ |
+| 데이터 처리 | pandas, numpy, openpyxl |
+| 시각화 | matplotlib, seaborn, plotly, folium |
+| 지리 데이터 | geopandas, shapely, pyproj |
+| 결과 저장 | NetCDF4 (`.nc`), Excel (`.xlsx`), CSV |
+
+---
+
+## 디렉터리 구조
+
+```
+PyPSA_GESI_Test/
+├── PyPSA_GUI.py                     # 메인 실행 파일 (네트워크 생성·최적화·결과 저장)
+├── integrated_input_data.xlsx       # 통합 입력 데이터
+├── interface.xlsx                   # 시나리오 인터페이스 설정
+├── requirements.txt                 # 패키지 의존성
+├── README_CPLEX.md                  # CPLEX 솔버 설정 가이드
+├── modules/                         # 보조 모듈
+│   ├── data_loader.py
+│   ├── network_builder.py
+│   ├── optimizer.py
+│   ├── result_processor.py
+│   └── visualization.py
+├── src/                             # 지도 시각화 등 추가 소스
+│   └── korea_map.py
+├── data/                            # 부하·재생에너지 시계열 원시 데이터
+└── results/                         # 최적화 결과 (gitignore 처리)
+```
+
+---
+
+## 라이선스 및 문의
+
+- 이 모델은 **녹색에너지전략연구소(GESI)** 내부 연구 목적으로 개발되었습니다.
+- 문의: [GESI 홈페이지](https://gesi.kr)
+
+---
+
+**버전**: 2.0.0  
+**최종 업데이트**: 2026-06  
+**개발 환경**: Python 3.10, PyPSA 0.21+, Windows 10/11

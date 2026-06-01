@@ -41,29 +41,38 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 
-# Output files
-annual_reports/*.xlsx
-demo_output/*.xlsx
-*.log
-*.txt
-!requirements_annual_report.txt
-
-# Temporary files
+# Temporary / lock files
 ~$*.xlsx
 ~$*.docx
+*.log
 
-# Project specific - exclude PyPSA project files
-PyPSA_GUI.py
-*.csv
-data/
+# Debug / test output text files
+debug_output.txt
+diagnosis_result.txt
+full_test_output.txt
+test_output.txt
+runlog*.txt
+run_multi.log
+run_now.log
+
+# Interface backup files (working copies)
+"interface - 복사본.xlsx"
+interface_0506.xlsx
+interface_backup_*.xlsx
+integrated_input_data_backup_*.xlsx
+
+# Large result outputs (exclude from repo)
 results/
-results_multi_3years/
+results_multi*/
 output_regional_capacity/
-modules/
-src/
-발표자료_출력/
-시나리오 분석/
-*.bat
-!run_gesi_collector.bat
+viz_temp/
 
-# Keep only GESI Annual Report files
+# Old GESI Annual Report files (no longer maintained)
+gesi_annual_report_system.py
+demo_gesi_system.py
+analyze_gesi_website.py
+requirements_annual_report.txt
+run_gesi_collector.bat
+GESI_Annual_Report_사용가이드.md
+GESI_시스템_설명.md
+gesi_structure_analysis.json

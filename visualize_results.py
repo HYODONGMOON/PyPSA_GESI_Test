@@ -418,6 +418,52 @@ def compute_corridor_utilization(n, excel_caps=None):
     return pd.DataFrame(result, index=n.snapshots)
 
 
+def compute_corridor_max_line_util(n):
+    """
+    복도별 시간별 '개별 선로 최대 이용률'(%) DataFrame 반환.
+
+    각 시간대마다 복도 내 여러 병렬 선로 중 가장 높게 이용된 선로의
+    이용률(= |p0_i| / s_nom_basic_i × 100)을 반환합니다.
+
+    집계 이용률 대신 이 값을 포화 시간 계산에 사용하면,
+    일부 선로만 포화 상태여도 정확하게 검출됩니다.
+    """
+    flex_info = load_interface_flex_info()
+    _rv = set(REGIONS)
+    def _valid(c):
+        p = c.split('_')
+        return len(p) >= 2 and p[0] in _rv and p[-1] in _rv and p[0] != p[-1]
+
+    corr_line_series = {}   # {corridor: [Series, ...]}
+
+    if not n.lines.empty and hasattr(n.lines_t, 'p0') and not n.lines_t.p0.empty:
+        for line in n.lines_t.p0.columns:
+            if line not in n.lines.index:
+                continue
+            corr = get_corridor(line)
+            if not _valid(corr):
+                continue
+            nc_snom = float(n.lines.at[line, 's_nom'])
+            fi = flex_info.get(line)
+            if fi and fi['basic'] > 0:
+                ratio = nc_snom / fi['basic']
+                cap = fi['basic'] if 0.5 <= ratio <= 5.0 else nc_snom
+            else:
+                cap = nc_snom
+            if cap <= 0:
+                continue
+            line_util = n.lines_t.p0[line].abs() / cap * 100.0
+            corr_line_series.setdefault(corr, []).append(line_util)
+
+    result = {}
+    for corr, series_list in corr_line_series.items():
+        if not series_list:
+            continue
+        result[corr] = pd.concat(series_list, axis=1).max(axis=1)
+
+    return pd.DataFrame(result, index=n.snapshots)
+
+
 def compute_re_output_ts(n):
     gp  = _gens_p(n)
     re  = n.generators[n.generators['carrier'].isin(RE_CARRIERS)].index
@@ -505,9 +551,12 @@ def chart1_line_utilization(n, out_path):
         for corr, d in corr_caps.items()
     }
 
-    # 포화 시간: 각 복도의 최대 허용 이용률 × 99.5% 이상인 시간
-    sat_hours  = pd.Series({
-        corr: int((util[corr] >= max_cap_pct.get(corr, 100) * 0.995).sum())
+    # 포화 시간: 복도 내 개별 선로 이용률 기준 (집계가 아닌 개별 선로 최대값)
+    # 이유: 병렬 선로 중 일부만 포화여도 집계 이용률은 99.5%에 미달할 수 있음
+    max_line_util = compute_corridor_max_line_util(n)
+    sat_hours = pd.Series({
+        corr: int((max_line_util[corr] >= max_cap_pct.get(corr, 100.0) * 0.995).sum())
+        if corr in max_line_util.columns else 0
         for corr in util.columns
     })
     zero_hours = (util <= 0.1).sum()

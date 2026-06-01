@@ -239,6 +239,76 @@ def _read_dc_fab_from_interface(interface_path, existing_load_names):
         return None
 
 
+def _apply_coal_efficiencies_from_db(network, interface_path):
+    """
+    interface.xlsx Coal_DB 시트의 AM열(효율)을 석탄 발전기에 적용합니다.
+
+    매핑 방식: 지역(A열) 기준, Coal_DB 행 순서 = integrated_input_data 발전기 순서
+    - Coal_DB 행 6~끝: 지역코드(A) + 발전소명(D) + 효율(AM열=39번째)
+    - 네트워크 내 coal 발전기를 carrier=='coal' 로 식별, 지역별 순서 유지
+    - 지역별 건수가 일치하면 1:1 매핑, 불일치 시 경고 후 가능한 범위만 적용
+
+    효과: Coal_DB 수정 → PyPSA 모델에 자동 반영 (integrated_input_data 수동 갱신 불필요)
+    """
+    try:
+        import openpyxl as _opxl
+        if not os.path.exists(interface_path):
+            return
+        wb = _opxl.load_workbook(interface_path, data_only=True)
+        if 'Coal_DB' not in wb.sheetnames:
+            print("  [Coal_DB] 시트 없음 — 석탄 발전기 효율 적용 생략")
+            return
+        ws = wb['Coal_DB']
+
+        # Coal_DB: 지역별 효율 목록 (행 순서 유지)
+        db_effs = {}          # {region: [eff1, eff2, ...]}
+        db_plants = {}        # {region: [plant_name1, ...]} (참고용 로그)
+        for r in range(6, ws.max_row + 1):
+            region = ws.cell(r, 1).value
+            plant  = ws.cell(r, 4).value
+            eff    = ws.cell(r, 39).value
+            if not region or eff is None:
+                continue
+            region = str(region).strip().upper()
+            db_effs.setdefault(region, []).append(float(eff))
+            db_plants.setdefault(region, []).append(str(plant or '').strip())
+
+        # 네트워크 내 석탄 발전기를 지역별·등록 순서대로 수집
+        coal_by_region = {}
+        for gen_name in network.generators.index:
+            if network.generators.at[gen_name, 'carrier'] == 'coal':
+                region = gen_name.split('_')[0].upper()
+                coal_by_region.setdefault(region, []).append(gen_name)
+
+        applied = changed = skipped = 0
+        for region, gen_names in coal_by_region.items():
+            region_effs   = db_effs.get(region, [])
+            region_plants = db_plants.get(region, [])
+            if not region_effs:
+                print(f"  [Coal_DB] {region}: Coal_DB에 항목 없음 — 생략")
+                skipped += len(gen_names)
+                continue
+            if len(region_effs) != len(gen_names):
+                print(f"  [Coal_DB] {region}: Coal_DB {len(region_effs)}건 ≠ 모델 {len(gen_names)}건 "
+                      f"→ 앞부터 순서대로 {min(len(region_effs), len(gen_names))}건 적용")
+            for i, gen_name in enumerate(gen_names):
+                if i >= len(region_effs):
+                    skipped += 1
+                    continue
+                new_eff = region_effs[i]
+                old_eff = float(network.generators.at[gen_name, 'efficiency'])
+                network.generators.at[gen_name, 'efficiency'] = new_eff
+                applied += 1
+                if abs(old_eff - new_eff) > 1e-4:
+                    plant_nm = region_plants[i] if i < len(region_plants) else '?'
+                    print(f"  [Coal_DB] {gen_name} ({plant_nm}): eff {old_eff:.4f} → {new_eff:.4f}")
+                    changed += 1
+
+        print(f"  [Coal_DB] 석탄 발전기 효율 적용 완료: {applied}건 (변경 {changed}건, 미매핑 {skipped}건)")
+    except Exception as _e:
+        print(f"  [Coal_DB] 효율 적용 실패: {_e}")
+
+
 def _read_links_from_interface(interface_path, existing_link_names):
     """interface.xlsx 지역별 시트의 링크 섹션에서 신규 링크 읽기.
 
@@ -893,8 +963,8 @@ def create_network(input_data):
             'AC': {'name': 'AC', 'co2_emissions': 0},
             'DC': {'name': 'DC', 'co2_emissions': 0},
             'electricity': {'name': 'electricity', 'co2_emissions': 0},
-            'coal': {'name': 'coal', 'co2_emissions': 0.8384 * 0.47},  # 석탄 전력량기준 × 평균효율0.47
-            'gas': {'name': 'gas', 'co2_emissions': 0.38 * 0.53},      # LNG 전력량기준 × 평균효율0.53
+            'coal': {'name': 'coal', 'co2_emissions': 0.73 * 0.47},  # 석탄 전력량기준 × 평균효율0.47
+            'gas': {'name': 'gas', 'co2_emissions': 0.33 * 0.53},     # LNG 전력량기준 × 평균효율0.53
             'nuclear': {'name': 'nuclear', 'co2_emissions': 0},
             'solar': {'name': 'solar', 'co2_emissions': 0},
             'wind': {'name': 'wind', 'co2_emissions': 0},
@@ -1060,7 +1130,12 @@ def create_network(input_data):
                 
                 network.add("Generator", **params)
                 print(f"발전기 추가됨: {gen_name} (p_nom: {p_nom_value}, carrier: {params['carrier']})")
-        
+
+        # Coal_DB 효율 적용: interface.xlsx Coal_DB 시트 AM열 → 개별 석탄 발전기 efficiency 갱신
+        print("\n=== Coal_DB 개별 효율 적용 ===")
+        _iface_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'interface.xlsx'))
+        _apply_coal_efficiencies_from_db(network, _iface_path)
+
         # 발전기 추가 후 재생에너지 패턴 적용
         print("\n=== 재생에너지 패턴 적용 시작 ===")
         pv_applied_count = 0
@@ -1310,64 +1385,12 @@ def create_network(input_data):
                         network.generators_t.p_max_pu[fallback_name] = pd.Series(1.0, index=network.snapshots)
                         print(f"열 보강 발전기 추가(확장가능/매우고비용): {fallback_name} (버스 {bus})")
                     continue
-                # 전력 버스: LNG 보완발전기(확장가능/매우고비용) 추가 — 실제 전력부하가 있을 때만
+                # 전력 버스: LNG_Fallback_Gen / Slack_Gen 비활성화
+                # - 전력 시스템은 석탄/LNG/원자력/RE 등 충분한 발전원이 있으므로 보완 발전기 불필요
+                # - 이들이 있으면 CO2 계산 왜곡(efficiency=0.5 적용해도 LP 변수 증가)
+                # - Infeasible 발생 시 모델 설정 오류 진단 신호로 활용
                 if bus_carrier == 'electricity' or bus_carrier == 'AC':
-                    has_el_load = False
-                    try:
-                        total = 0.0
-                        # 1) 네트워크 시계열 기준
-                        if (not network.loads.empty) and (hasattr(network.loads_t, 'p_set') and not network.loads_t.p_set.empty):
-                            load_names = network.loads.index[network.loads.bus.astype(str) == bus]
-                            for nm in load_names:
-                                if nm in network.loads_t.p_set.columns:
-                                    total += float(np.nansum(network.loads_t.p_set[nm].values))
-                        # 2) 폴백: 입력 데이터 기준
-                        if total <= 0.0:
-                            loads_df = input_data.get('loads', pd.DataFrame())
-                            if not loads_df.empty and 'bus' in loads_df.columns and 'p_set' in loads_df.columns:
-                                sub = loads_df[loads_df['bus'].astype(str) == bus]
-                                if not sub.empty:
-                                    total = float(pd.to_numeric(sub['p_set'], errors='coerce').fillna(0).sum())
-                        has_el_load = total > 0.0
-                    except Exception:
-                        has_el_load = True
-                    if not has_el_load:
-                        continue
-                    fallback_name = f"{bus}_LNG_Fallback_Gen"
-                    if fallback_name not in network.generators.index:
-                        network.add("Generator",
-                                   name=fallback_name,
-                                   bus=bus,
-                                   p_nom=0.0,
-                                   p_nom_extendable=True,
-                                   capital_cost=1e7,
-                                   marginal_cost=1e6,
-                                   carrier='gas')
-                        network.generators_t.p_max_pu[fallback_name] = pd.Series(1.0, index=network.snapshots)
-                        print(f"전력 보완 발전기 추가(확장가능/매우고비용): {fallback_name} (버스 {bus})")
-                    # 전력 슬랙 발전기(무한 확장/초고비용) 추가 - infeasible 방지를 위해 기본 활성화
-                    try:
-                        # infeasible 방지를 위해 기본적으로 활성화 (DISABLE_POWER_SLACK=1로 비활성화 가능)
-                        disable_slack = os.environ.get('DISABLE_POWER_SLACK', '0')
-                        print(f"DEBUG: DISABLE_POWER_SLACK={disable_slack}, 버스 {bus}")
-                        if disable_slack != '1':
-                            slack_name = f"{bus}_Slack_Gen"
-                            if slack_name not in network.generators.index:
-                                slack_cost = float(os.environ.get('SLACK_GEN_COST', '1e9'))
-                                network.add("Generator",
-                                           name=slack_name,
-                                           bus=bus,
-                                           p_nom=0.0,
-                                           p_nom_extendable=True,
-                                           p_nom_min=0.0,
-                                           p_nom_max=1e6,  # 매우 큰 확장 한계
-                                           capital_cost=0.0,
-                                           marginal_cost=slack_cost,
-                                           carrier='gas')  # 슬랙 발전기를 LNG 기반으로 설정하여 배출량 계산
-                                network.generators_t.p_max_pu[slack_name] = pd.Series(1.0, index=network.snapshots)
-                                print(f"전력 슬랙 발전기 추가(infeasible 방지): {slack_name} (버스 {bus}, mcost={slack_cost})")
-                    except Exception as _e_sl:
-                        print(f"슬랙 발전기 추가 경고: {_e_sl}")
+                    print(f"[전력 보완 발전기] 비활성화됨: {bus} (LNG_Fallback, Slack 추가 안 함)")
                 # 수소 버스: 수소 백업기(필요시)
                 if bus_carrier == 'hydrogen':
                     total_load = 0.0
@@ -1526,20 +1549,13 @@ def create_network(input_data):
                                    carrier='heat')
                         network.generators_t.p_max_pu[fallback_name] = pd.Series(1.0, index=network.snapshots)
                         added_backup += 1
-                # 전력 버스: LNG 백업기
+                # 전력 버스: LNG 백업기 비활성화
+                # - efficiency 미지정 시 PyPSA 기본값 1.0 적용 → CO2/MWh_e = 0.2014 (실제 LNG 0.4028의 절반)
+                # - CO2 제약이 타이트해지면 최적화기가 이 발전기를 대량 사용(CO2 shadow price 급등)
+                # - 결과적으로 LNG 배출량이 절반으로 보고되는 왜곡 발생
+                # - 실제 전력 시스템은 석탄/LNG/원자력/RE만으로 충분하므로 비활성화
                 if bus_carrier_post == 'electricity' and total_load > 0.0:
-                    fallback_name = f"{bus}_LNG_Fallback_Gen"
-                    if fallback_name not in network.generators.index:
-                        network.add("Generator",
-                                   name=fallback_name,
-                                   bus=bus,
-                                   p_nom=0.0,
-                                   p_nom_extendable=True,
-                                   capital_cost=1e7,
-                                   marginal_cost=1e6,
-                                   carrier='gas')
-                        network.generators_t.p_max_pu[fallback_name] = pd.Series(1.0, index=network.snapshots)
-                        added_backup += 1
+                    print(f"[전력 사후 백업 발전기] 비활성화됨: {bus} (LNG_Fallback 추가 안 함 — CO2 왜곡 방지)")
                 # 수소 버스: 수소 백업기(필요시)
                 if bus_carrier_post == 'hydrogen' and total_load > 0.0:
                     fallback_name = f"{bus}_H2_Fallback_Gen"
@@ -2599,8 +2615,13 @@ def optimize_network(network):
             sopts = variant['opts']
             print(f"\n[시도] CPLEX 방법: {vname}, 옵션: {sopts}")
             try:
+                # ── 석탄 최소 발전량 제약 비활성화 ────────────────────
+                # (CO2 제약과 충돌하여 결과 왜곡 발생 → 필요 시 재활성화)
+                # COAL_MIN_ANNUAL_MWH = 90_500_000   # 연간 석탄 최소 발전량 (MWh)
+                print("[coal_min] 석탄 최소 발전량 제약 비활성화됨")
+
                 def _combined_extra_functionality(n, sns):
-                    """DR 연간 한도 + 선로 유연 운영 제약 통합"""
+                    """DR 연간 한도 + 선로 유연 운영 통합 (석탄 최소 제약 제거)"""
                     _dr_annual_hours_constraint(n, sns)
                     _line_flex_constraint(n, sns)
 
