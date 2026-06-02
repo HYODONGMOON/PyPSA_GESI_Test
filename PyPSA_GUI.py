@@ -71,6 +71,12 @@ except Exception as _map_e:
 # 상수 정의
 INPUT_FILE = "integrated_input_data.xlsx"
 
+# ── 시각화 생략 플래그 ────────────────────────────────────────────────────────
+# True : 시각화·지역분석 후처리 건너뜀 (장기 시나리오 반복 분석용 고속 모드)
+# False: 시각화·지역분석 포함 (기본, 단기 분석용)
+# run_longterm_scenario.py 에서 자동으로 True 로 설정됨
+SKIP_VISUALIZATION = False
+
 def _normalize_region_code(value):
     try:
         s = str(value).strip()
@@ -2090,7 +2096,8 @@ def create_network(input_data):
                 '조건': 'sense', 'sense': 'sense',
                 '유형': 'type', 'type': 'type',
                 '대상속성': 'carrier_attribute', 'carrier_attribute': 'carrier_attribute',
-                '적용지역': 'region', 'region': 'region', '적용 지역': 'region'
+                '적용지역': 'region', 'region': 'region', '적용 지역': 'region',
+                '적용연도': 'year', 'year': 'year', '연도': 'year',
             }
             std_cols = {}
             for c in constraints_df.columns:
@@ -2098,24 +2105,46 @@ def create_network(input_data):
                 std_cols[c] = rename_map.get(key, key)
             constraints_df.rename(columns=std_cols, inplace=True)
 
+            # 현재 시나리오 연도 추출 (timeseries start_time 기준)
+            scenario_year = None
+            try:
+                if 'timeseries' in input_data and not input_data['timeseries'].empty:
+                    st = str(input_data['timeseries'].iloc[0].get('start_time', ''))
+                    if st:
+                        scenario_year = int(st[:4])
+            except Exception:
+                pass
+
+            def _filter_by_year(df):
+                """'year' 컬럼이 있으면 현재 시나리오 연도와 일치하는 행만 반환.
+                'year' 컬럼이 없거나 비어있으면 모든 행을 반환 (연도 무관 적용).
+                """
+                if 'year' not in df.columns or scenario_year is None:
+                    return df
+                year_vals = pd.to_numeric(df['year'], errors='coerce')
+                # NaN(연도 미지정) → 모든 연도에 적용
+                mask = year_vals.isna() | (year_vals == scenario_year)
+                return df[mask]
+
             # 1) CO2 제약 처리
             co2_limit = pd.DataFrame()
             if 'name' in constraints_df.columns:
                 # CO2_limit 또는 CO2Limit 모두 지원
                 co2_mask = constraints_df['name'].astype(str).str.strip().isin(['CO2_limit', 'CO2Limit'])
-                co2_limit = constraints_df[co2_mask]
+                co2_limit = _filter_by_year(constraints_df[co2_mask])
 
             if not co2_limit.empty:
                 const_col = 'constant' if 'constant' in co2_limit.columns else None
                 if const_col:
                     limit_value = float(pd.to_numeric(co2_limit.iloc[0][const_col], errors='coerce'))
+                    year_info = f" ({scenario_year}년 적용)" if scenario_year else ""
                     network.add("GlobalConstraint",
                                 name="CO2_limit",
                                 type="primary_energy",
                                 carrier_attribute="co2_emissions",
                                 sense="<=",
                                 constant=limit_value)
-                    print(f"[OK] PyPSA CO2 배출량 제약조건 추가됨: ≤ {limit_value/1e6:.1f}백만톤 (전력량 기준)")
+                    print(f"[OK] PyPSA CO2 배출량 제약조건 추가됨{year_info}: ≤ {limit_value/1e6:.1f}백만톤 (전력량 기준)")
                     print(f"   carrier.co2_emissions는 efficiency 보정됨 (전력량기준 × 평균효율)")
                 else:
                     print("경고: constraints 시트에 'constant' 컬럼이 없어 CO2Limit을 적용하지 못했습니다.")
@@ -2123,7 +2152,7 @@ def create_network(input_data):
             # 2) RPS (재생에너지 의무 비중) 제약 처리
             if 'type' in constraints_df.columns:
                 rps_mask = constraints_df['type'].astype(str).str.strip().str.upper() == 'RPS'
-                rps_constraints = constraints_df[rps_mask]
+                rps_constraints = _filter_by_year(constraints_df[rps_mask])
                 
                 if not rps_constraints.empty:
                     print(f"\n[RE] 재생에너지 의무 비중(RPS) 제약 추가 중...")
@@ -3880,29 +3909,32 @@ def save_results(network, filename=None, subdir=None):
         # 4. PyPSA 네트워크 파일 저장
         network.export_to_netcdf(f'{results_dir}/optimization_result_{current_time}.nc')
 
-        # 5. 지역별 분석 결과 생성
-        analyze_regional_results(network, results_dir, current_time)
+        if SKIP_VISUALIZATION:
+            print("[시각화 생략] SKIP_VISUALIZATION=True — 지역분석·시각화·후처리를 건너뜁니다.")
+        else:
+            # 5. 지역별 분석 결과 생성
+            analyze_regional_results(network, results_dir, current_time)
 
-        # 6. 시각화 결과 생성
-        create_visualizations(network, results_dir, current_time)
+            # 6. 시각화 결과 생성
+            create_visualizations(network, results_dir, current_time)
 
-        # 6.5. 커스텀 시각화 5종 (results_dir/images/ 폴더)
-        try:
-            create_custom_visualizations(network, results_dir)
-        except Exception as _e_cv:
-            print(f"커스텀 시각화 생성 경고: {_e_cv}")
+            # 6.5. 커스텀 시각화 5종 (results_dir/images/ 폴더)
+            try:
+                create_custom_visualizations(network, results_dir)
+            except Exception as _e_cv:
+                print(f"커스텀 시각화 생성 경고: {_e_cv}")
 
-        # 7. 계절별 대표 구간 시각화 (5종 × 4계절, 전국)
-        try:
-            create_seasonal_analysis_charts(network, results, results_dir, current_time)
-        except Exception as _e_sea:
-            print(f"계절별 시각화 생성 경고: {_e_sea}")
+            # 7. 계절별 대표 구간 시각화 (5종 × 4계절, 전국)
+            try:
+                create_seasonal_analysis_charts(network, results, results_dir, current_time)
+            except Exception as _e_sea:
+                print(f"계절별 시각화 생성 경고: {_e_sea}")
 
-        # 8. 지역별 × 계절별 시각화 (5종 × 4계절 × 각 지역)
-        try:
-            create_regional_analysis_charts(network, results, results_dir, current_time)
-        except Exception as _e_reg:
-            print(f"지역별 시각화 생성 경고: {_e_reg}")
+            # 8. 지역별 × 계절별 시각화 (5종 × 4계절 × 각 지역)
+            try:
+                create_regional_analysis_charts(network, results, results_dir, current_time)
+            except Exception as _e_reg:
+                print(f"지역별 시각화 생성 경고: {_e_reg}")
 
         print(f"결과가 '{results_dir}' 폴더에 저장되었습니다.")
         print(f"- Excel 파일: {excel_filename}")

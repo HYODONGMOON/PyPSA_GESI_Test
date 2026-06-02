@@ -51,6 +51,11 @@ import argparse
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
+import PyPSA_GUI as _gui
+
+# 장기 시나리오 분석은 반복 실행이 많으므로 시각화·후처리를 자동 생략
+_gui.SKIP_VISUALIZATION = True
+
 from PyPSA_GUI import (
     INPUT_FILE,
     read_input_data,
