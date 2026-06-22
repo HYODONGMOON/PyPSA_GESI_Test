@@ -2626,7 +2626,7 @@ def optimize_network(network):
                 import traceback
                 traceback.print_exc()
         
-        # 최적화 옵션: 기본 Barrier (May 8 성공 당시와 동일)
+        # 최적화 옵션: 기본 Barrier (May 8 / Jun 2 성공 당시와 동일)
         # - lpmethod=4: Barrier 내부점법 (대규모 LP에서 가장 빠름)
         # - parallel=1: 결정론적 병렬 (재현성 보장)
         # - barrier.algorithm=3: Mehrotra predictor-corrector
