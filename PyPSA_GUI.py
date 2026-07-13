@@ -1,11 +1,69 @@
 ﻿import os as _os
 import sys as _sys
+import traceback as _tb_early
+
+# ── exe 실행 시 가장 먼저 로그 파일 오픈 (import 오류도 포착) ─────────────
+_IS_FROZEN  = getattr(_sys, 'frozen', False)
+_EXE_DIR    = _os.path.dirname(_sys.executable) if _IS_FROZEN else _os.path.dirname(_os.path.abspath(__file__))
+_LOG_PATH   = _os.path.join(_EXE_DIR, 'pypsa_analysis_log.txt')
+_log_file   = None
+_orig_stdout = _sys.stdout
+_orig_stderr = _sys.stderr
+
+if _IS_FROZEN:
+    try:
+        _log_file = open(_LOG_PATH, 'w', encoding='utf-8', buffering=1)
+
+        class _Tee:
+            def __init__(self, *streams):
+                self._s = streams
+            def write(self, data):
+                for s in self._s:
+                    try: s.write(data); s.flush()
+                    except Exception: pass
+            def flush(self):
+                for s in self._s:
+                    try: s.flush()
+                    except Exception: pass
+            @property
+            def encoding(self):
+                return getattr(self._s[0], 'encoding', 'utf-8')
+
+        _sys.stdout = _Tee(_sys.__stdout__, _log_file)
+        _sys.stderr = _Tee(_sys.__stderr__, _log_file)
+        print("=" * 60)
+        print("  PyPSA Analysis 시작")
+        print(f"  로그 파일: {_LOG_PATH}")
+        print("=" * 60)
+    except Exception as _e_log:
+        pass  # 로그 파일 오픈 실패 시 무시하고 계속
+
+# ── 일반 Python 실행 시: stdout/stderr를 UTF-8 + errors='replace'로 재설정 ──
+# Windows 기본 인코딩(cp949)은 ⚠ 등 유니코드 문자 출력 시 UnicodeEncodeError 발생
+# errors='replace' 로 출력 불가 문자를 '?'로 대체하여 크래시 방지
+if not _IS_FROZEN:
+    try:
+        if hasattr(_sys.stdout, 'reconfigure'):
+            _sys.stdout.reconfigure(errors='replace')
+        if hasattr(_sys.stderr, 'reconfigure'):
+            _sys.stderr.reconfigure(errors='replace')
+    except Exception:
+        pass
+
 
 def _ensure_proj_lib_env():
     try:
         if 'PROJ_LIB' in _os.environ and _os.environ.get('PROJ_LIB'):
             return
         candidates = []
+        # PyInstaller 실행파일 환경: exe 폴더 내 bundled proj 데이터 우선 탐색
+        if getattr(_sys, 'frozen', False):
+            _base = _os.path.dirname(_sys.executable)
+            candidates.append(_os.path.join(_base, 'pyproj', 'proj_dir', 'share', 'proj'))
+            candidates.append(_os.path.join(_base, 'share', 'proj'))
+            if hasattr(_sys, '_MEIPASS'):
+                candidates.append(_os.path.join(_sys._MEIPASS, 'pyproj', 'proj_dir', 'share', 'proj'))
+                candidates.append(_os.path.join(_sys._MEIPASS, 'share', 'proj'))
         try:
             # Conda/Windows 일반 경로
             candidates.append(_os.path.join(_sys.prefix, 'Library', 'share', 'proj'))
@@ -55,8 +113,54 @@ import sys
 import copy
 
 
-# src 폴더를 Python 경로에 추가
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+def get_base_dir():
+    """사용자 파일 디렉토리 반환 (interface.xlsx, results 등).
+
+    일반 Python 실행: PyPSA_GUI.py 가 있는 폴더
+    PyInstaller exe:  exe 파일이 위치한 폴더 (dist/PyPSA_Analysis/)
+                      ※ _internal/ 이 아닌 exe 바로 옆 폴더
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _get_bundle_dir():
+    """번들 내부 디렉토리 반환 (src/ 모듈 등 코드용).
+
+    PyInstaller 6.x 에서 번들 데이터는 _internal/ 폴더(sys._MEIPASS)에 위치.
+    """
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _setup_user_directory():
+    """exe 실행 시 사용자 폴더에 필요한 파일이 없으면 _internal/ 에서 복사.
+
+    interface.xlsx 가 exe 옆에 없으면 _internal/ 의 초기 버전을 복사해줌.
+    사용자는 항상 exe 옆의 interface.xlsx 를 편집하면 됨.
+    """
+    if not getattr(sys, 'frozen', False):
+        return
+    user_dir = get_base_dir()
+    bundle_dir = _get_bundle_dir()
+    for fname in ('interface.xlsx',):
+        dest = os.path.join(user_dir, fname)
+        src_path = os.path.join(bundle_dir, fname)
+        if not os.path.exists(dest) and os.path.exists(src_path):
+            try:
+                import shutil
+                shutil.copy2(src_path, dest)
+                print(f"[초기화] {fname} → {dest} 복사 완료")
+            except Exception as _e:
+                print(f"[경고] {fname} 복사 실패: {_e}")
+
+
+_setup_user_directory()
+
+# src 폴더를 Python 경로에 추가 (번들 내부 _internal/src/ 경로 사용)
+sys.path.append(os.path.join(_get_bundle_dir(), 'src'))
 
 # 지도 모듈은 선택적 임포트로 처리하여 rasterio/GDAL 미설치 시에도 실행이 가능하도록 함
 try:
@@ -464,7 +568,7 @@ def read_input_data(input_file):
     """Excel 파일에서 입력 데이터 읽기"""
     try:
         # 파일 경로 및 수정 시간 로깅
-        root_dir = os.path.dirname(__file__) 
+        root_dir = get_base_dir()
         integrated_path = os.path.abspath(os.path.join(root_dir, input_file))
         interface_path = os.path.abspath(os.path.join(root_dir, 'interface.xlsx'))
         try:
@@ -518,6 +622,39 @@ def read_input_data(input_file):
                     print("renewable_patterns를 interface.xlsx에서 보강 로딩했습니다.")
         except Exception as e:
             print(f"renewable_patterns 보강 로딩 실패: {str(e)}")
+
+        # Fallback: constraints 시트가 없으면 interface.xlsx에서 로딩 (CO2/RPS 제약 반영)
+        try:
+            cons_missing = ('constraints' not in input_data or
+                            not isinstance(input_data.get('constraints'), pd.DataFrame) or
+                            input_data['constraints'].empty)
+            if cons_missing and os.path.exists(interface_path):
+                raw = pd.read_excel(interface_path, sheet_name='constraints', header=None)
+                # 데이터 행 탐색: 첫 컬럼값이 'CO2_limit', 'CO2Limit', 'RPS_' 등 실제 제약명인 행
+                # (헤더행 다음 행이 실제 데이터 첫 행)
+                data_start = None
+                for i, row in raw.iterrows():
+                    first_val = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ''
+                    if first_val in ('CO2_limit', 'CO2Limit') or first_val.startswith('RPS_'):
+                        data_start = i
+                        break
+                if data_start is not None:
+                    # interface.xlsx constraints 컬럼 순서:
+                    # 0=이름, 1=유형, 2=연결속성, 3=조건, 4=값(상수), 5=적용지역, 6=설명
+                    eng_cols = ['name', 'type', 'carrier_attribute', 'sense', 'constant', 'region', 'description']
+                    df_cons = raw.iloc[data_start:].copy().reset_index(drop=True)
+                    # 실제 데이터 컬럼 수에 맞게 자르기
+                    n_cols = min(len(eng_cols), df_cons.shape[1])
+                    df_cons = df_cons.iloc[:, :n_cols].copy()
+                    df_cons.columns = eng_cols[:n_cols]
+                    df_cons = df_cons.dropna(subset=['name']).reset_index(drop=True)
+                    df_cons = df_cons[df_cons['name'].astype(str).str.strip().str.len() > 0]
+                    if not df_cons.empty:
+                        input_data['constraints'] = df_cons
+                        co2_rows = df_cons[df_cons['name'].astype(str).str.strip().isin(['CO2_limit', 'CO2Limit'])]
+                        print(f"constraints를 interface.xlsx에서 폴백 로딩 ({len(df_cons)}행, CO2: {len(co2_rows)}개)")
+        except Exception as e:
+            print(f"constraints 폴백 로딩 실패: {str(e)}")
         try:
             if os.path.exists(interface_path):
                 sd = pd.read_excel(interface_path, sheet_name='시나리오_에너지수요')
@@ -1139,7 +1276,7 @@ def create_network(input_data):
 
         # Coal_DB 효율 적용: interface.xlsx Coal_DB 시트 AM열 → 개별 석탄 발전기 efficiency 갱신
         print("\n=== Coal_DB 개별 효율 적용 ===")
-        _iface_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'interface.xlsx'))
+        _iface_path = os.path.abspath(os.path.join(get_base_dir(), 'interface.xlsx'))
         _apply_coal_efficiencies_from_db(network, _iface_path)
 
         # 발전기 추가 후 재생에너지 패턴 적용
@@ -1885,26 +2022,25 @@ def create_network(input_data):
                     network.add("Store", **params)
                     print(f"저장장치 {store_name} 추가됨 (버스: {bus_name})")
                     
-                    # EV_DSM 특별 처리: 매일 오전 6시에 80% 충전 상태 요구 [1단계]
+                    # EV_DSM 특별 처리: 매일 오전 6시에 80% 충전 상태 요구
                     if 'EV_DSM' in store_name:
-                        # 기본 e_min_pu 값 (Excel에서 읽었거나 기본값)
-                        base_e_min_pu = params.get('e_min_pu', 0.4)
-                        
+                        base_e_min_pu = params.get('e_min_pu', 0.3)
+
                         # 시간별 e_min_pu 생성
                         e_min_pu_series = pd.Series(base_e_min_pu, index=snapshots)
-                        
+
                         # 매일 오전 6시: 80% 충전 상태 요구
                         morning_mask = e_min_pu_series.index.hour == 6
                         e_min_pu_series[morning_mask] = 0.8
-                        
-                        # 시간별 e_min_pu 적용
+
                         network.stores_t.e_min_pu[store_name] = e_min_pu_series
-                        
-                        morning_count = morning_mask.sum()
-                        print(f"  [EV_DSM 시간별 설정] 기본: {base_e_min_pu:.2f} ({base_e_min_pu*100:.0f}%), 오전 6시: 0.80 (80%) - {morning_count}개 시점")
+
+                        morning_count = int(morning_mask.sum())
+                        print(f"  [EV_DSM 6시 충전 제약] {store_name}: "
+                              f"기본={base_e_min_pu:.2f}, 오전 6시=0.80 (80%) - {morning_count}개 시점")
                 else:
                     print(f"저장장치 {store_name} 건너뜀: 버스 '{bus_name}'가 존재하지 않음")
-        
+
         # 선로 추가 (있는 경우)
         if 'lines' in input_data and not input_data['lines'].empty:
             print("\n=== 선로 추가 시작 ===")
@@ -2220,7 +2356,7 @@ def create_network(input_data):
                 if (not has_gen) or ensure_slack:
                     slack_name = f"{bus}_Slack_Failsafe"
                     if slack_name not in network.generators.index:
-                        mcost = float(os.environ.get('SLACK_GEN_COST', '10000'))
+                        mcost = float(os.environ.get('SLACK_GEN_COST', '100000000'))
                         # 전력/열/수소 중 해당 캐리어로 무배출 초고비용 슬랙
                         carrier_val = bus_carrier if bus_carrier in ['electricity','heat','hydrogen'] else 'electricity'
                         network.add("Generator",
@@ -2290,8 +2426,8 @@ def optimize_network(network):
         # =====================================================================
         # DR(수요반응) 설정 - 하드코딩 파라미터
         # =====================================================================
-        DR_PEAK_PERCENTILE = 95   # 상위 5% 부하 시점에서만 발동 허용
-        DR_ANNUAL_HOURS    = 100  # 연간 최대 발동시간 (시간)
+        DR_PEAK_PERCENTILE = 90   # 상위 10% 부하 시점에서만 발동 허용
+        DR_ANNUAL_HOURS    = 300  # 연간 최대 발동시간 (시간)
         # =====================================================================
 
         # DR 발전기 p_max_pu 설정: 각 지역 전력수요 상위 5% 시점에만 1, 나머지 0
@@ -2398,7 +2534,7 @@ def optimize_network(network):
         # 선로 유연 운영 설정 — 인터페이스_1 F/G/H열 기반
         # =====================================================================
         _flex_iface_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), 'interface.xlsx'))
+            os.path.join(get_base_dir(), 'interface.xlsx'))
         _line_flex = _read_line_flex_settings(_flex_iface_path)
 
         if _line_flex:
@@ -2626,36 +2762,155 @@ def optimize_network(network):
                 import traceback
                 traceback.print_exc()
         
-        # 최적화 옵션: 기본 Barrier (May 8 / Jun 2 성공 당시와 동일)
-        # - lpmethod=4: Barrier 내부점법 (대규모 LP에서 가장 빠름)
-        # - parallel=1: 결정론적 병렬 (재현성 보장)
-        # - barrier.algorithm=3: Mehrotra predictor-corrector
-        option_variants = [
-            {'name': 'barrier',
-             'opts': {'threads': num_cores, 'lpmethod': 4,
-                      'parallel': 1, 'barrier.algorithm': 3}},
-        ]
-        print(f"[최적화 설정] Barrier (기본 설정), 스레드: {num_cores}개")
+        # ── 솔버 선택 ─────────────────────────────────────────────────────────
+        def _detect_solver():
+            # exe 빌드: HiGHS 고정 (CPLEX DLL 번들 불가)
+            if getattr(sys, 'frozen', False):
+                print("[솔버] 실행파일 모드 → HiGHS 사용")
+                return 'highs'
+            # 일반 Python 실행: CPLEX 우선, 없으면 HiGHS
+            try:
+                import cplex  # noqa: F401
+                print("[솔버 감지] CPLEX 사용 가능 → CPLEX 선택")
+                return 'cplex'
+            except (ImportError, Exception):
+                pass
+            try:
+                import highspy  # noqa: F401
+                print("[솔버 감지] CPLEX 없음 → HiGHS 로 대체")
+                return 'highs'
+            except ImportError:
+                pass
+            print("[솔버 감지] CPLEX/HiGHS 모두 없음 → glpk 시도")
+            return 'glpk'
+
+        active_solver = _detect_solver()
+
+        # ── 솔버별 옵션 설정 ──────────────────────────────────────────────────
+        if active_solver == 'cplex':
+            # 기본 Barrier (May 8 / Jun 2 성공 당시와 동일)
+            # - lpmethod=4: Barrier 내부점법 (대규모 LP에서 가장 빠름)
+            # - parallel=1: 결정론적 병렬 (재현성 보장)
+            # - barrier.algorithm=3: Mehrotra predictor-corrector
+            option_variants = [
+                {'name': 'barrier',
+                 'opts': {'threads': num_cores, 'lpmethod': 4,
+                          'parallel': 1, 'barrier.algorithm': 3}},
+            ]
+            print(f"[최적화 설정] CPLEX Barrier, 스레드: {num_cores}개")
+        else:
+            # HiGHS: IPM(내부점법)으로 대규모 LP 처리
+            option_variants = [
+                {'name': 'ipm',
+                 'opts': {'threads': num_cores, 'solver': 'ipm',
+                          'presolve': 'on'}},
+                {'name': 'simplex',
+                 'opts': {'threads': num_cores, 'solver': 'simplex',
+                          'presolve': 'on'}},
+            ]
+            print(f"[최적화 설정] HiGHS IPM (CPLEX 미설치), 스레드: {num_cores}개")
 
         last_status = None
         last_error = None
         for variant in option_variants:
             vname = variant['name']
             sopts = variant['opts']
-            print(f"\n[시도] CPLEX 방법: {vname}, 옵션: {sopts}")
+            print(f"\n[시도] {active_solver.upper()} 방법: {vname}, 옵션: {sopts}")
             try:
                 # ── 석탄 최소 발전량 제약 비활성화 ────────────────────
                 # (CO2 제약과 충돌하여 결과 왜곡 발생 → 필요 시 재활성화)
                 # COAL_MIN_ANNUAL_MWH = 90_500_000   # 연간 석탄 최소 발전량 (MWh)
                 print("[coal_min] 석탄 최소 발전량 제약 비활성화됨")
 
+                def _chp_co2_constraint(n, sns):
+                    """CHP Links(gas carrier)를 포함한 통합 CO2 제약 추가.
+                    PyPSA GlobalConstraint primary_energy는 Generator만 포함하므로
+                    Link 타입 CHP의 배출량을 별도 통합 제약으로 추가한다.
+                    (기존 GlobalConstraint는 유지 - 이 제약이 더 엄격해 실제 적용됨)
+                    """
+                    try:
+                        if 'CO2_limit' not in n.global_constraints.index:
+                            return
+                        total_co2_limit = float(n.global_constraints.loc['CO2_limit', 'constant'])
+
+                        if 'gas' not in n.carriers.index:
+                            return
+                        gas_co2 = float(n.carriers.loc['gas', 'co2_emissions'])
+                        if gas_co2 == 0:
+                            return
+
+                        if 'carrier' not in n.links.columns:
+                            return
+                        chp_links = n.links[n.links['carrier'] == 'gas']
+                        if chp_links.empty:
+                            return
+
+                        m = n.model
+                        if 'Link-p' not in m.variables:
+                            return
+
+                        weights = n.snapshot_weightings['generators'].loc[sns]
+                        link_p_var = m.variables['Link-p']
+                        try:
+                            available_links = list(link_p_var.coords['Link'].values)
+                        except (KeyError, AttributeError):
+                            available_links = []
+
+                        active_chp = [lnk for lnk in chp_links.index if lnk in available_links]
+                        if not active_chp:
+                            return
+
+                        all_exprs = []
+
+                        # 1) CHP 링크 가스 소비 × 배출계수
+                        for link_name in active_chp:
+                            p0 = link_p_var.sel(Link=link_name, snapshot=sns)
+                            all_exprs.append((p0 * weights).sum('snapshot') * gas_co2)
+
+                        # 2) 기존 GlobalConstraint가 커버하는 Generator 배출량도 합산
+                        #    → 통합 제약: gen_CO2 + CHP_CO2 ≤ total_co2_limit
+                        emissions_map = n.carriers['co2_emissions'][n.carriers['co2_emissions'] != 0]
+                        if not emissions_map.empty and 'Generator-p' in m.variables:
+                            gens = n.generators.query("carrier in @emissions_map.index")
+                            if not gens.empty:
+                                try:
+                                    from pypsa.optimization.common import get_as_dense
+                                    eff = get_as_dense(n, "Generator", "efficiency",
+                                                       snapshots=sns, inds=gens.index)
+                                    em_pu = gens['carrier'].map(emissions_map) / eff
+                                    em_pu_w = em_pu.multiply(weights, axis=0)
+                                    p_gen = m.variables['Generator-p'].sel(
+                                        Generator=gens.index, snapshot=sns)
+                                    all_exprs.append((p_gen * em_pu_w).sum())
+                                except Exception:
+                                    pass
+
+                        if not all_exprs:
+                            return
+
+                        try:
+                            from linopy.expressions import merge as lm_merge
+                            combined = lm_merge(all_exprs) if len(all_exprs) > 1 else all_exprs[0]
+                        except Exception:
+                            combined = all_exprs[0]
+                            for ex in all_exprs[1:]:
+                                combined = combined + ex
+
+                        m.add_constraints(combined <= total_co2_limit,
+                                          name='CO2-generators-and-links')
+                        print(f"  [CO2 통합제약] 발전기+CHP({len(active_chp)}개) "
+                              f"≤ {total_co2_limit/1e6:.1f}백만톤 추가됨")
+                    except Exception as e_co2:
+                        print(f"  [경고] CHP CO2 통합제약 추가 실패: {e_co2}")
+
                 def _combined_extra_functionality(n, sns):
-                    """DR 연간 한도 + 선로 유연 운영 통합 (석탄 최소 제약 제거)"""
+                    """DR 연간 한도 + 선로 유연 운영 + CHP CO2 통합"""
                     _dr_annual_hours_constraint(n, sns)
                     _line_flex_constraint(n, sns)
+                    _chp_co2_constraint(n, sns)
 
                 status = network.optimize(
-                    solver_name='cplex',
+                    solver_name=active_solver,
                     solver_options=sopts,
                     extra_functionality=_combined_extra_functionality
                 )
@@ -2754,26 +3009,37 @@ def extract_results(network):
     """주요 결과 추출"""
     
     # 재생에너지 Curtailment 계산
+    # [주의] 확장가능(extendable) 발전기는 p_nom_opt(최적화된 용량)를 기준으로 잠재발전량 계산
+    # p_nom(초기 용량) 사용 시 실제 발전량이 잠재량을 초과하여 커튼먼트가 누락 또는 과소평가됨
     re_curtailment = {}
     for gen in network.generators.index:
         if any(keyword in gen.lower() for keyword in ['pv', 'solar', 'wind', 'wt']):
             if gen in network.generators_t.p_max_pu.columns and gen in network.generators_t.p.columns:
-                # 잠재 발전량 (curtailment 없을 때)
-                potential = (network.generators.loc[gen, 'p_nom'] * 
-                           network.generators_t.p_max_pu[gen])
-                
+                # 확장가능 발전기는 p_nom_opt(최적화 용량) 사용, 고정 발전기는 p_nom 사용
+                extendable = bool(network.generators.at[gen, 'p_nom_extendable']) if 'p_nom_extendable' in network.generators.columns else False
+                has_opt = ('p_nom_opt' in network.generators.columns and
+                           pd.notna(network.generators.at[gen, 'p_nom_opt']) and
+                           float(network.generators.at[gen, 'p_nom_opt']) > 0)
+                if extendable and has_opt:
+                    p_nom_val = float(network.generators.at[gen, 'p_nom_opt'])
+                else:
+                    p_nom_val = float(network.generators.at[gen, 'p_nom'])
+
+                # 잠재 발전량 (p_nom_opt × p_max_pu 프로필)
+                potential = network.generators_t.p_max_pu[gen] * p_nom_val
+
                 # 실제 발전량 (최적화 결과)
                 actual = network.generators_t.p[gen]
-                
-                # Curtailment (시간별)
-                curtailment = potential - actual
-                
+
+                # Curtailment: 확장발전기는 actual ≤ p_nom_opt × p_max_pu 보장되므로 항상 ≥ 0
+                curtailment = (potential - actual).clip(lower=0)
+
                 if curtailment.sum() > 0.1:  # 0.1 MWh 이상만 기록
                     re_curtailment[gen] = {
                         'timeseries': curtailment,
-                        'total_MWh': curtailment.sum(),
-                        'potential_MWh': potential.sum(),
-                        'actual_MWh': actual.sum(),
+                        'total_MWh': float(curtailment.sum()),
+                        'potential_MWh': float(potential.sum()),
+                        'actual_MWh': float(actual.sum()),
                         'curtailment_rate_%': (curtailment.sum() / potential.sum() * 100) if potential.sum() > 0 else 0
                     }
     
@@ -2833,14 +3099,9 @@ def _classify_technology(gen_or_link_name):
         return 'CHP'
     if 'lng' in name or 'gas' in name:
         return 'LNG'
-    if 'slack' in name or 'fallback' in name:
-        # 슬랙/폴백 발전기는 연결 버스 타입에 따라 분류
-        if '_h_' in name or 'heat' in name:
-            return '열'
-        elif '_h2_' in name or 'hydrogen' in name:
-            return '수소'
-        else:
-            return 'LNG'  # 전력 슬랙은 LNG 기반
+    if 'slack' in name or 'fallback' in name or 'failsafe' in name:
+        # Slack/Failsafe 발전기는 모델 수렴용 보조 발전기 → 별도 카테고리
+        return 'Slack'
     if 'oil' in name or 'diesel' in name:
         return '석유'
     if 'biomass' in name or 'bio' in name:
@@ -2892,8 +3153,10 @@ def build_final_energy_supply_tables(network):
     
     if not network.generators.empty and not network.generators_t.p.empty:
         for gen in network.generators.index:
-            # Fuel_Supply 발전기는 중간 연료 공급이므로 최종 에너지 집계에서 제외
-            if 'fuel_supply' in gen.lower():
+            # Fuel_Supply / Slack / Fallback 발전기는 최종 에너지 집계에서 제외
+            # (Slack/Fallback은 모델 실행 가능성 보장용 보조 발전기 - 실제 발전원 아님)
+            gen_lower = gen.lower()
+            if 'fuel_supply' in gen_lower or 'slack' in gen_lower or 'fallback' in gen_lower:
                 continue
             
             bus = network.generators.at[gen, 'bus']
@@ -2929,6 +3192,10 @@ def build_final_energy_supply_tables(network):
             return None
         bus_col = f"bus{port_idx}"
         for link in network.links.index:
+            # Slack/Fallback 링크는 집계 제외
+            link_lower = link.lower()
+            if 'slack' in link_lower or 'fallback' in link_lower or 'fuel_supply' in link_lower:
+                continue
             if bus_col not in network.links.columns:
                 continue
             if _pd.isna(network.links.at[link, bus_col]):
@@ -3049,10 +3316,14 @@ def build_regional_power_balance_table(network):
             gn = gen.lower()
             if 'pv' in gn or 'solar' in gn or 'wt' in gn or 'wind' in gn:
                 region_data[region]['re_generation'] += gen_sum
-                # Curtailment 계산
+                # Curtailment 계산 (확장발전기는 p_nom_opt 사용)
                 if gen in network.generators_t.p_max_pu.columns:
-                    p_nom = float(network.generators.at[gen, 'p_nom'])
-                    potential = network.generators_t.p_max_pu[gen] * p_nom
+                    _extendable = bool(network.generators.at[gen, 'p_nom_extendable']) if 'p_nom_extendable' in network.generators.columns else False
+                    _has_opt = ('p_nom_opt' in network.generators.columns and
+                                pd.notna(network.generators.at[gen, 'p_nom_opt']) and
+                                float(network.generators.at[gen, 'p_nom_opt']) > 0)
+                    _p_nom = float(network.generators.at[gen, 'p_nom_opt']) if (_extendable and _has_opt) else float(network.generators.at[gen, 'p_nom'])
+                    potential = network.generators_t.p_max_pu[gen] * _p_nom
                     actual = network.generators_t.p[gen]
                     curtailed = float((potential - actual).clip(lower=0).sum())
                     region_data[region]['curtailment'] += curtailed
@@ -4756,7 +5027,7 @@ def create_custom_visualizations(network, results_dir):
     images_dir = os.path.join(results_dir, 'images')
     try:
         import sys as _sys
-        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        _script_dir = get_base_dir()
         if _script_dir not in _sys.path:
             _sys.path.insert(0, _script_dir)
 
@@ -6198,7 +6469,7 @@ def run_multi_year_sequence(years, base_input_file=INPUT_FILE, overrides_by_year
         print(f"\n===== {year}년도 분석 시작 =====")
         # 0) 연도별 interface 시나리오를 통합 파일에 반영(시트 직접 갱신)
         try:
-            root_dir = os.path.dirname(__file__)
+            root_dir = get_base_dir()
             integrated_path = os.path.abspath(os.path.join(root_dir, base_input_file))
             interface_path = os.path.abspath(os.path.join(root_dir, 'interface.xlsx'))
             _update_integrated_for_year(integrated_path, interface_path, year)
@@ -6213,7 +6484,7 @@ def run_multi_year_sequence(years, base_input_file=INPUT_FILE, overrides_by_year
         # 1.6) 버스명 표준화 및 전 시트 반영(예: BSN_BSN_EL → BSN_EL)
         input_data = standardize_bus_names_in_input(input_data)
         try:
-            integrated_path = os.path.abspath(os.path.join(os.path.dirname(__file__), base_input_file))
+            integrated_path = os.path.abspath(os.path.join(get_base_dir(), base_input_file))
             _persist_standardized_input(integrated_path, input_data)
         except Exception as _e:
             print(f"표준화된 버스명 저장 경고: {str(_e)}")
@@ -6257,7 +6528,7 @@ def run_multi_year_sequence(years, base_input_file=INPUT_FILE, overrides_by_year
 def ensure_integrated_input():
     """interface.xlsx 기반으로 integrated_input_data.xlsx 생성/업데이트"""
     try:
-        root_dir = os.path.dirname(__file__)
+        root_dir = get_base_dir()
         integrated_path = os.path.abspath(os.path.join(root_dir, INPUT_FILE))
         interface_path = os.path.abspath(os.path.join(root_dir, 'interface.xlsx'))
 
@@ -6866,7 +7137,7 @@ def build_overrides_for_years(years, base_input_file):
     - generators: interface.xlsx '시나리오_발전기' 시트에 정의된 용량 반영
     """
     try:
-        root_dir = os.path.dirname(__file__)
+        root_dir = get_base_dir()
         interface_path = os.path.abspath(os.path.join(root_dir, 'interface.xlsx'))
         base = read_input_data(base_input_file)
         freq = '1h'
@@ -6940,7 +7211,7 @@ def _apply_scenario_to_loads_in_input(input_data, scenario_year):
         if 'loads' not in input_data or input_data['loads'].empty:
             return input_data
         # interface.xlsx 경로
-        root_dir = os.path.dirname(__file__)
+        root_dir = get_base_dir()
         interface_path = os.path.abspath(os.path.join(root_dir, 'interface.xlsx'))
         if not os.path.exists(interface_path):
             return input_data
@@ -7135,7 +7406,7 @@ def _run_week_uc_analysis(input_data, full_network, uc_week):
     # interface.xlsx에 committable=True로 설정된 발전기만 UC 적용
     # (현재 input_data에는 False로 강제됐을 수 있으므로, 원본 interface에서 재로드)
     try:
-        root_dir = os.path.dirname(__file__)
+        root_dir = get_base_dir()
         interface_path = os.path.abspath(os.path.join(root_dir, 'interface.xlsx'))
         xls_iface = pd.ExcelFile(interface_path)
         # 지역별 시트에서 committable=True 발전기 이름 수집
@@ -7277,7 +7548,7 @@ def main():
     input_data = standardize_bus_names_in_input(input_data)
 
     try:
-        integrated_path = os.path.abspath(os.path.join(os.path.dirname(__file__), INPUT_FILE))
+        integrated_path = os.path.abspath(os.path.join(get_base_dir(), INPUT_FILE))
         _persist_standardized_input(integrated_path, input_data)
     except Exception as e:
         print(f"표준화 저장 중 오류: {str(e)}")
@@ -7309,4 +7580,31 @@ def main():
     print("\n모든 과정 완료!")
 
 if __name__ == "__main__":
-    main()
+    if _IS_FROZEN:
+        try:
+            main()
+            print("\n" + "=" * 60)
+            print("  분석이 정상적으로 완료되었습니다.")
+            print(f"  결과 폴더: {_os.path.join(_EXE_DIR, 'results')}")
+            print("=" * 60)
+        except Exception as _e_main:
+            print("\n" + "=" * 60)
+            print("  [오류] 분석 중 예외가 발생했습니다:")
+            print(f"  {_e_main}")
+            print("-" * 60)
+            _tb_early.print_exc()
+            print("=" * 60)
+            print(f"\n자세한 내용은 로그 파일을 확인하세요:\n  {_LOG_PATH}")
+        finally:
+            if _log_file:
+                try:
+                    _log_file.flush()
+                    _log_file.close()
+                except Exception:
+                    pass
+            _sys.stdout = _orig_stdout
+            _sys.stderr = _orig_stderr
+
+        input("\nEnter 키를 누르면 창이 닫힙니다...")
+    else:
+        main()
