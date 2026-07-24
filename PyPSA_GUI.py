@@ -1,150 +1,54 @@
 ﻿import os as _os
 import sys as _sys
 import traceback as _tb_early
-from datetime import datetime as _dt
 
-# ── 로그 파일 경로 설정 ────────────────────────────────────────────────────
+# ── exe 실행 시 가장 먼저 로그 파일 오픈 (import 오류도 포착) ─────────────
 _IS_FROZEN  = getattr(_sys, 'frozen', False)
 _EXE_DIR    = _os.path.dirname(_sys.executable) if _IS_FROZEN else _os.path.dirname(_os.path.abspath(__file__))
-_LOG_STAMP  = _dt.now().strftime('%Y%m%d_%H%M%S')
-_LOG_PATH   = _os.path.join(_EXE_DIR, f'logs', f'analysis_{_LOG_STAMP}.log')
+_LOG_PATH   = _os.path.join(_EXE_DIR, 'pypsa_analysis_log.txt')
 _log_file   = None
 _orig_stdout = _sys.stdout
 _orig_stderr = _sys.stderr
 
-# logs 폴더 생성
-try:
-    _os.makedirs(_os.path.join(_EXE_DIR, 'logs'), exist_ok=True)
-except Exception:
-    _LOG_PATH = _os.path.join(_EXE_DIR, f'analysis_{_LOG_STAMP}.log')
+if _IS_FROZEN:
+    try:
+        _log_file = open(_LOG_PATH, 'w', encoding='utf-8', buffering=1)
 
+        class _Tee:
+            def __init__(self, *streams):
+                self._s = streams
+            def write(self, data):
+                for s in self._s:
+                    try: s.write(data); s.flush()
+                    except Exception: pass
+            def flush(self):
+                for s in self._s:
+                    try: s.flush()
+                    except Exception: pass
+            @property
+            def encoding(self):
+                return getattr(self._s[0], 'encoding', 'utf-8')
 
-def _is_verbose_line(line: str) -> bool:
-    """터미널에 숨길 세부 출력인지 판단 (True → 파일만, False → 터미널+파일)"""
-    # 빈 줄은 숨김
-    if not line.strip():
-        return True
-    # 항상 터미널에 표시할 키워드
-    _ALWAYS_SHOW = (
-        '===', '────', '──',
-        '최적화 시작', '최적화 완료', '최적화 실패', '전체 기간 분석',
-        '결과가 ', '폴더에 저장', '모든 과정 완료', '분석 완료', '결과 저장',
-        'ERROR', 'WARNING', 'Traceback', 'Exception',
-        'CPLEX', 'HiGHS', 'Barrier', 'optimal', 'infeasible', 'feasible',
-        '→ 상태:', '▶ 상태', '최종 최적화',
-        'Itn ', 'Presolve ', 'Barrier time', 'Total time on',
-        '[솔버 감지]', '[최적화 설정]', '[시도]', 'solve problem',
-        'Writing constraints', 'Writing continuous', 'Writing objective',
-        'assign_solution',
-        '[OK] PROJ_LIB', '[OK] PyPSA CO2',
-        'Solution status', 'Termination condition', 'Objective:',
-        'WARNING:linopy', 'WARNING:pypsa', 'INFO:linopy',
-    )
-    for kw in _ALWAYS_SHOW:
-        if kw in line:
-            return False
-    # 들여쓰기 2칸 이상 → 세부 로그 (숨김)
-    if line.startswith('  '):
-        return True
-    # 특정 접두사로 시작하는 세부 항목 → 숨김
-    _NOISY_STARTS = (
-        '선로 ', '저장장치 ', '발전기 ', '부하 추가됨', '링크 추가됨',
-        'p_max_pu', 'p_min_pu', '가스 연료공급',
-        'BSN_', 'CBD_', 'CND_', 'GBD_', 'GGD_', 'GND_', 'GWD_',
-        'ICN_', 'JBD_', 'JJD_', 'JND_',
-        '버스 ', '버스: ', 'RPS 제약 존재',
-        '링크 효율 NaN', '열 보강 발전기',
-    )
-    stripped = line.lstrip()
-    for ns in _NOISY_STARTS:
-        if stripped.startswith(ns):
-            return True
-    return False
+        _sys.stdout = _Tee(_sys.__stdout__, _log_file)
+        _sys.stderr = _Tee(_sys.__stderr__, _log_file)
+        print("=" * 60)
+        print("  PyPSA Analysis 시작")
+        print(f"  로그 파일: {_LOG_PATH}")
+        print("=" * 60)
+    except Exception as _e_log:
+        pass  # 로그 파일 오픈 실패 시 무시하고 계속
 
-
-class _SmartTee:
-    """모든 출력을 로그 파일에 저장, 터미널에는 중요 메시지만 표시"""
-    def __init__(self, log_path, real_stdout):
-        self._real = real_stdout
-        try:
-            self._file = open(log_path, 'w', encoding='utf-8', errors='replace', buffering=1)
-        except Exception:
-            self._file = None
-        self._linebuf = ''
-
-    def write(self, data):
-        if self._file:
-            try:
-                self._file.write(data)
-                self._file.flush()
-            except Exception:
-                pass
-        # 줄 단위로 필터링
-        combined = self._linebuf + data
-        lines = combined.split('\n')
-        self._linebuf = lines[-1]  # 미완성 줄 보류
-        for line in lines[:-1]:
-            full = line + '\n'
-            if not _is_verbose_line(full):
-                try:
-                    self._real.write(full)
-                    self._real.flush()
-                except Exception:
-                    pass
-
-    def flush(self):
-        if self._file:
-            try: self._file.flush()
-            except Exception: pass
-        try: self._real.flush()
-        except Exception: pass
-
-    def close(self):
-        # 남은 버퍼 처리
-        if self._linebuf:
-            if not _is_verbose_line(self._linebuf):
-                try: self._real.write(self._linebuf); self._real.flush()
-                except Exception: pass
-            if self._file:
-                try: self._file.write(self._linebuf)
-                except Exception: pass
-        if self._file:
-            try: self._file.close()
-            except Exception: pass
-
-    @property
-    def encoding(self):
-        return getattr(self._real, 'encoding', 'utf-8')
-
-    def isatty(self):
-        return False
-
-
-# ── stdout/stderr를 SmartTee로 교체 (exe·스크립트 모두) ──────────────────
-try:
-    _real_stdout = _sys.__stdout__ if _IS_FROZEN else _sys.stdout
-    # Windows cp949 인코딩 오류 방지
-    if not _IS_FROZEN and hasattr(_real_stdout, 'reconfigure'):
-        try: _real_stdout.reconfigure(errors='replace')
-        except Exception: pass
-    _log_file = None  # 호환성 유지
-    _smart_tee = _SmartTee(_LOG_PATH, _real_stdout)
-    _sys.stdout = _smart_tee
-    # stderr는 파일만 (터미널엔 그대로)
-    _sys.stderr = _real_stdout
-    print("=" * 60)
-    print(f"  PyPSA Analysis 시작  |  로그: logs/analysis_{_LOG_STAMP}.log")
-    print("=" * 60)
-except Exception as _e_tee:
-    # 실패 시 fallback: 기존 방식
-    if not _IS_FROZEN:
-        try:
-            if hasattr(_sys.stdout, 'reconfigure'):
-                _sys.stdout.reconfigure(errors='replace')
-            if hasattr(_sys.stderr, 'reconfigure'):
-                _sys.stderr.reconfigure(errors='replace')
-        except Exception:
-            pass
+# ── 일반 Python 실행 시: stdout/stderr를 UTF-8 + errors='replace'로 재설정 ──
+# Windows 기본 인코딩(cp949)은 ⚠ 등 유니코드 문자 출력 시 UnicodeEncodeError 발생
+# errors='replace' 로 출력 불가 문자를 '?'로 대체하여 크래시 방지
+if not _IS_FROZEN:
+    try:
+        if hasattr(_sys.stdout, 'reconfigure'):
+            _sys.stdout.reconfigure(errors='replace')
+        if hasattr(_sys.stderr, 'reconfigure'):
+            _sys.stderr.reconfigure(errors='replace')
+    except Exception:
+        pass
 
 
 def _ensure_proj_lib_env():
