@@ -2525,21 +2525,19 @@ def create_network(input_data):
         else:
             print("경고: constraints 시트가 없거나 비어있습니다.")
         
-        # 최종 안전장치: 전력(EL/EV) 슬랙 비활성화 — 열/수소 fallback은 별도 루프에서 처리
-        # ensure_slack = False → EL, EV 버스에 Slack_Failsafe 추가 안 함
+        # 최종 안전장치: EV 버스 슬랙 활성화 (1e6 원/MWh), EL 버스는 비활성화
+        # - EV 버스: 1e6 원/MWh (EV 수요가 EV 버스에 있으므로 필수)
+        # - EL 버스: 자체 발전기(PV, WT, Nuclear 등)가 있으므로 슬랙 불필요
         try:
             failsafe_added = 0
-            ensure_slack = False  # EL/EV 슬랙 비활성화
-            print("최후수단 슬랙 발전기(EL/EV) 비활성화됨")
+            ensure_slack = False  # EL 버스 슬랙 비활성화 (발전기 있어서 불필요)
+            # ── EL/EV/열/수소 버스 슬랙 루프 ──
             for bus in network.buses.index:
                 try:
                     bus_carrier = str(network.buses.at[bus, 'carrier']).lower()
                 except Exception:
                     bus_carrier = ''
                 if bus_carrier not in ['electricity', 'heat', 'hydrogen']:
-                    continue
-                # EL/EV 버스: 슬랙 비활성화 (열/수소는 별도 루프에서 처리)
-                if bus_carrier in ['electricity']:
                     continue
                 # 해당 버스 부하 존재 여부
                 has_load = False
@@ -2572,9 +2570,10 @@ def create_network(input_data):
                 if (not has_gen) or ensure_slack:
                     slack_name = f"{bus}_Slack_Failsafe"
                     if slack_name not in network.generators.index:
-                        # EV 버스: 100만 원/MWh (전력/열/수소보다 저렴, 수치 안정성)
-                        # 전력/열/수소 버스: 1000만 원/MWh (최후 수단)
-                        if bus.endswith('_EV'):
+                        # EV 버스: 1e6 원/MWh (EV slack)
+                        # EL/전력 버스(일반): ensure_slack=False라서 발전기 있으면 추가 안 함
+                        # 열/수소 버스: 1e7 원/MWh (최후 수단)
+                        if bus_carrier == 'electricity':
                             mcost = 1_000_000.0   # 1e6
                         else:
                             mcost = float(os.environ.get('SLACK_GEN_COST', '10000000'))  # 1e7 기본값
@@ -3787,39 +3786,36 @@ def _build_country_timeseries_tables(network):
 
 def _build_analysis_window_sheet(network, results, writer, start_dt=None, n_hours=168):
     """
-    선로 포화 구간 중심 168시간(1주일) 분석 윈도우 시트 생성.
+    Analysis Window 시트 – 동적 대시보드 (수식 기반)
 
-    Parameters
-    ----------
-    network  : pypsa.Network
-    results  : dict  (extract_results 반환값)
-    writer   : pd.ExcelWriter (openpyxl engine)
-    start_dt : None | str | pd.Timestamp
-        None이면 선로 포화도 최대 구간을 자동 탐색
-    n_hours  : int  기본 168 (=1주일)
+    수정 방법
+    ---------
+    • B2 (분석 시작): 원하는 날짜/시간을 입력 (형식: YYYY-MM-DD HH:MM)
+    • D2 (기간 선택): 드롭다운에서 3일 / 7일 / 14일 선택
+    → 아래 7개 섹션 데이터가 자동 갱신
 
-    Sheet layout (섹션 수직 배치)
-    ─────────────────────────────
-    1. 타이틀 / 기간 정보
-    2. 송전망 조류 (조류MW + 포화율%)
-    3. 발전원별 출력 집계 (PV/WT/Nuclear/Coal/LNG/Hydro/CHP/DR/기타)
-    4. 유연성자원/섹터커플링 (링크 조류MW)
-    5. 저장설비 (충방전MW / SoC MWh)
-    6. 재생에너지 Curtailment (MWh)
-    7. 지역별 시간별 전력수요 (MW)
+    설계 핵심
+    ---------
+    - Row 3 (HELPER_ROW): 각 소스 시트에서 B2 시각의 행번호를 MATCH로 캐시
+    - 데이터 수식: INDEX(source!col, HELPER_CELL + i)  → 부동소수점 오차 없음
+    - 최대 336행 (14일) 미리 수식 작성
     """
     import pandas as _pd
     import numpy as _np
     try:
         from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.datavalidation import DataValidation
     except ImportError:
         print("Analysis_Window 생성 생략: openpyxl 없음")
         return
 
+    MAX_WIN = 336   # 최대 행수 = 14일
+    REGIONS  = {'BSN','CBD','CND','GBD','GGD','GND','GWD','ICN','JBD','JJD','JND'}
     snapshots = network.snapshots
+    wb        = writer.book
 
-    # ── 시작 시점 자동 결정 (선로 포화도 최대 구간) ──────────────
+    # ── 기본 시작 시점 자동 결정 ─────────────────────────────────────
     auto_detected = start_dt is None
     if auto_detected:
         try:
@@ -3833,9 +3829,8 @@ def _build_analysis_window_sheet(network, results, writer, start_dt=None, n_hour
                         if s_nom > 0:
                             util[line] = network.lines_t.p0[line].abs() / s_nom
                 if not util.empty:
-                    peak_ts  = util.max(axis=1).idxmax()
-                    peak_loc = snapshots.get_loc(peak_ts)
-                    # peak를 윈도우의 1/4 지점에 배치
+                    peak_ts   = util.max(axis=1).idxmax()
+                    peak_loc  = snapshots.get_loc(peak_ts)
                     start_loc = max(0, peak_loc - n_hours // 4)
                     start_dt  = snapshots[start_loc]
                 else:
@@ -3846,219 +3841,205 @@ def _build_analysis_window_sheet(network, results, writer, start_dt=None, n_hour
             start_dt = snapshots[0]
 
     start_dt = _pd.Timestamp(start_dt)
-    end_dt   = start_dt + _pd.Timedelta(hours=n_hours)
-
-    mask = (snapshots >= start_dt) & (snapshots < end_dt)
-    idx  = snapshots[mask]
-    if len(idx) == 0:
-        idx = snapshots[:min(n_hours, len(snapshots))]
-
-    print(f"[Analysis_Window] {idx[0]} ~ {idx[-1]}  ({len(idx)}h)"
+    print(f"[Analysis_Window] 기본값 {start_dt}  ({n_hours}h)"
           + ("  [자동: 선로 포화 최대 구간]" if auto_detected else ""))
 
-    bus_carrier = network.buses.carrier.to_dict() if not network.buses.empty else {}
-
-    def _is_el(bus_name):
-        c = str(bus_carrier.get(bus_name, '')).lower()
-        return ('electric' in c or c in ['el', 'ac', 'dc', 'hvac', 'hvdc']
-                or str(bus_name).upper().endswith('_EL'))
-
-    # ── 섹션별 DataFrame 준비 ────────────────────────────────────
-
-    # 1) 선로 조류 + 포화율
-    sec_line = _pd.DataFrame(index=idx)
+    # ── Corridor_Line_Flow 시트 생성 (지역간 연결선 MW 통합) ──────────
     try:
+        corridor_data = {}
         if hasattr(network.lines_t, 'p0') and not network.lines_t.p0.empty:
             for line in network.lines_t.p0.columns:
-                p = network.lines_t.p0[line].reindex(idx).fillna(0)
-                sec_line[f'{line}_조류_MW'] = p.round(2).values
-                if line in network.lines.index:
-                    s_nom = float(network.lines.at[line, 's_nom'])
-                    if s_nom > 0:
-                        sec_line[f'{line}_포화율_%'] = (p.abs() / s_nom * 100).round(1).values
-    except Exception as _e:
-        print(f"  [AW] 선로 조류 준비 경고: {_e}")
-
-    # 2) 발전원별 출력 집계 (전력 버스 연결 발전기만)
-    _coal_kw = ['당진','영흥','하동','삼척','태안','보령','삼천포','호남','동해',
-                '강릉안인','북평','신서천','고성','여수','삼척그린파워']
-    _agg_keys = ['PV_MW','WT_MW','Nuclear_MW','Coal_MW','LNG_MW',
-                 'Hydro_MW','CHP_MW','DR_MW','기타_MW']
-    _agg = {k: _np.zeros(len(idx)) for k in _agg_keys}
-    try:
-        if hasattr(network.generators_t, 'p') and not network.generators_t.p.empty:
-            for gen in network.generators_t.p.columns:
-                if gen not in network.generators.index:
+                if line not in network.lines.index:
                     continue
-                bus = str(network.generators.at[gen, 'bus'])
-                if not _is_el(bus):
+                b0 = str(network.lines.at[line, 'bus0'])
+                b1 = str(network.lines.at[line, 'bus1'])
+                r0 = b0.split('_')[0]; r1 = b1.split('_')[0]
+                if r0 == r1:
                     continue
-                p = network.generators_t.p[gen].reindex(idx).fillna(0).values
-                gn = gen.lower()
-                if 'pv' in gn or 'solar' in gn:
-                    _agg['PV_MW'] += p
-                elif 'wt' in gn or 'wind' in gn:
-                    _agg['WT_MW'] += p
-                elif 'nuclear' in gn:
-                    _agg['Nuclear_MW'] += p
-                elif 'coal' in gn or any(kw in gn for kw in _coal_kw):
-                    _agg['Coal_MW'] += p
-                elif 'chp' in gn:
-                    _agg['CHP_MW'] += p
-                elif 'lng' in gn or 'gas' in gn:
-                    _agg['LNG_MW'] += p
-                elif 'hydro' in gn or 'water' in gn:
-                    _agg['Hydro_MW'] += p
-                elif 'dr' in gn.split('_'):
-                    _agg['DR_MW'] += p
-                else:
-                    _agg['기타_MW'] += p
-    except Exception as _e:
-        print(f"  [AW] 발전원 집계 경고: {_e}")
-    sec_gen = _pd.DataFrame({k: _np.round(v, 2) for k, v in _agg.items()}, index=idx)
-    # 값이 전부 0인 열 제거
-    sec_gen = sec_gen.loc[:, (sec_gen.abs() > 0.01).any()]
+                corr = '-'.join(sorted([r0, r1]))
+                p = network.lines_t.p0[line]
+                corridor_data[corr] = corridor_data.get(corr, _pd.Series(0.0, index=snapshots)) + p
+        if corridor_data:
+            corr_df = _pd.DataFrame(corridor_data, index=snapshots)
+            corr_df.index.name = 'Timestamp'
+            if 'Corridor_Line_Flow' not in wb.sheetnames:
+                corr_df.to_excel(writer, sheet_name='Corridor_Line_Flow')
+            print(f"  Corridor_Line_Flow: {len(corridor_data)}개 회랑 저장")
+    except Exception as _ec:
+        print(f"  Corridor_Line_Flow 경고: {_ec}")
 
-    # 3) 링크 조류 (유연성자원 / 섹터커플링)
-    sec_link = _pd.DataFrame(index=idx)
-    try:
-        if hasattr(network.links_t, 'p0') and not network.links_t.p0.empty:
-            for link in network.links_t.p0.columns:
-                p = network.links_t.p0[link].reindex(idx).fillna(0)
-                sec_link[f'{link}_MW'] = p.round(2).values
-    except Exception as _e:
-        print(f"  [AW] 링크 조류 준비 경고: {_e}")
+    # ── 소스 시트 컬럼 구조 파악 ─────────────────────────────────────
+    def _src_cols(sheet_name, el_only=False):
+        if sheet_name not in wb.sheetnames:
+            return []
+        try:
+            ws_s  = wb[sheet_name]
+            row1  = [cell.value for cell in next(ws_s.iter_rows(min_row=1, max_row=1))]
+            result = []
+            for i, val in enumerate(row1):
+                if i == 0: continue
+                if val is None or not str(val).strip(): continue
+                name = str(val).strip()
+                if el_only and not name.endswith('_EL'):
+                    continue
+                result.append((name, i + 1))   # (컬럼명, 엑셀 1-based col 인덱스)
+            return result
+        except Exception as _e:
+            return []
 
-    # 4) 저장설비 (충방전 MW, SoC MWh)
-    sec_sto = _pd.DataFrame(index=idx)
-    try:
-        if hasattr(network, 'stores_t'):
-            st = network.stores_t
-            if hasattr(st, 'p') and st.p is not None and not st.p.empty:
-                for s in st.p.columns:
-                    sec_sto[f'{s}_충방전_MW'] = st.p[s].reindex(idx).fillna(0).round(2).values
-            if hasattr(st, 'e') and st.e is not None and not st.e.empty:
-                for s in st.e.columns:
-                    sec_sto[f'{s}_SoC_MWh'] = st.e[s].reindex(idx).fillna(0).round(2).values
-    except Exception as _e:
-        print(f"  [AW] 저장설비 준비 경고: {_e}")
-
-    # 5) RE Curtailment 시계열
-    sec_curt = _pd.DataFrame(index=idx)
-    try:
-        if results and 're_curtailment' in results and results['re_curtailment']:
-            for gen, data in results['re_curtailment'].items():
-                ts = data.get('timeseries')
-                if ts is not None:
-                    sec_curt[f'{gen}_MWh'] = ts.reindex(idx).fillna(0).round(2).values
-    except Exception as _e:
-        print(f"  [AW] Curtailment 준비 경고: {_e}")
-
-    # 6) 지역별 시간별 전력수요
-    sec_load = _pd.DataFrame(index=idx)
-    try:
-        ldf = _pd.DataFrame()
-        if hasattr(network.loads_t, 'p') and not network.loads_t.p.empty:
-            ldf = network.loads_t.p
-        elif hasattr(network.loads_t, 'p_set') and not network.loads_t.p_set.empty:
-            ldf = network.loads_t.p_set
-        if not ldf.empty:
-            for ld in ldf.columns:
-                bus = str(network.loads.at[ld, 'bus']) if ld in network.loads.index else ''
-                if _is_el(bus):
-                    sec_load[f'{ld}_MW'] = ldf[ld].reindex(idx).fillna(0).round(2).values
-    except Exception as _e:
-        print(f"  [AW] 부하 준비 경고: {_e}")
-
-    # ── openpyxl로 시트 작성 ─────────────────────────────────────
-    wb = writer.book
+    # ── Analysis_Window 시트 ─────────────────────────────────────────
+    if 'Analysis_Window' in wb.sheetnames:
+        del wb['Analysis_Window']
     ws = wb.create_sheet('Analysis_Window')
 
-    def _fill(hex6):
-        return PatternFill('solid', fgColor=hex6)
-
-    HEAD_FILL = _fill('BDD7EE')
+    def _fill(hex6): return PatternFill('solid', fgColor=hex6)
+    HEAD_FILL  = _fill('BDD7EE')
+    GRAY_FILL  = _fill('F2F2F2')
     WHITE_BOLD = Font(bold=True, color='FFFFFF', size=10)
     BOLD9      = Font(bold=True, size=9)
     NORM9      = Font(size=9)
+    GRAY7      = Font(size=7, color='AAAAAA', italic=True)
+    DT_FMT     = 'YYYY-MM-DD HH:MM'
 
-    SECTIONS = [
-        ('1. 송전망 조류 현황  (조류 MW / 포화율 %)',         sec_line, '1F4E79'),
-        ('2. 발전원별 출력 현황  (MW)',                        sec_gen,  '375623'),
-        ('3. 유연성자원 / 섹터커플링 운영현황  (링크 조류 MW)', sec_link, '7030A0'),
-        ('4. 저장설비 현황  (충방전 MW / SoC MWh)',            sec_sto,  'C55A11'),
-        ('5. 재생에너지 Curtailment  (MWh)',                   sec_curt, '843C0C'),
-        ('6. 지역별 시간별 전력수요  (MW)',                     sec_load, '155F8A'),
+    # ── Row 1: 타이틀 ─────────────────────────────────────────────────
+    INPUT_ROW  = 2
+    HELPER_ROW = 3
+
+    ws.cell(1, 1, '■ Analysis Window – 섹터커플링 운영 현황 분석').font = \
+        Font(bold=True, size=13, color='1F4E79')
+
+    # ── Row 2: 입력 셀 ────────────────────────────────────────────────
+    ws.cell(INPUT_ROW, 1, '분석 시작').font = BOLD9
+
+    # B2: 시작 일시 (사용자 수정 가능)
+    c_b2 = ws.cell(INPUT_ROW, 2, start_dt.to_pydatetime())
+    c_b2.number_format = DT_FMT
+    c_b2.font = Font(bold=True, size=11, color='C00000')
+
+    ws.cell(INPUT_ROW, 3, '기간 선택').font = BOLD9
+
+    # D2: 드롭다운 (3일/7일/14일)
+    default_label = '7일' if n_hours <= 168 else ('14일' if n_hours >= 336 else '3일')
+    c_d2 = ws.cell(INPUT_ROW, 4, default_label)
+    c_d2.font = Font(bold=True, size=11, color='C00000')
+    dv = DataValidation(type='list', formula1='"3일,7일,14일"',
+                        allow_blank=False, showDropDown=False)
+    ws.add_data_validation(dv)
+    dv.sqref = f'D{INPUT_ROW}'
+
+    # E2: 시간 환산 (수식, 숨김용)
+    HOURS_CELL = f'$E${INPUT_ROW}'
+    ws.cell(INPUT_ROW, 5,
+        f'=IF($D${INPUT_ROW}="3일",72,IF($D${INPUT_ROW}="14일",336,168))'
+    ).font = Font(size=8, color='888888', italic=True)
+
+    ws.cell(INPUT_ROW, 6, '분석 종료 (자동)').font = BOLD9
+    c_g2 = ws.cell(INPUT_ROW, 7, f'=$B${INPUT_ROW}+{HOURS_CELL}/24')
+    c_g2.number_format = DT_FMT
+    c_g2.font = Font(italic=True, size=9, color='7030A0')
+
+    ws.cell(INPUT_ROW, 9,
+        f'※ B{INPUT_ROW}(시작)·D{INPUT_ROW}(기간) 수정 시 아래 표 자동 갱신'
+    ).font = Font(italic=True, size=8, color='595959')
+
+    # ── Row 3: 헬퍼 행 (MATCH 캐시 – 각 소스 시트의 B2 기준 시작 행번호) ──
+    ws.cell(HELPER_ROW, 1, '내부설정').font = GRAY7
+    ws.cell(HELPER_ROW, 1).fill = GRAY_FILL
+    ws.cell(HELPER_ROW, 2, '(수정금지)').font = GRAY7
+
+    # 소스 시트별 헬퍼 열 인덱스 (1-based)
+    SECTIONS_DEF = [
+        ('1. 송전망 조류 현황  (지역간 연결선 통합, MW)',        'Corridor_Line_Flow',        '1F4E79', False,  3),
+        ('2. 발전원별 출력 현황  (MW)',                         'National_Gen_Output',        '375623', False,  4),
+        ('3. 유연성자원 / 섹터커플링 운영현황  (링크 조류 MW)',  'National_Link_Flow',         '7030A0', False,  5),
+        ('4. 저장설비 현황(저장량)  (MWh)',                     'National_Storage_Energy',    'C55A11', False,  6),
+        ('5. 저장설비 현황(출입)  (MW)',                        'National_Storage_Power',     '833C00', False,  7),
+        ('6. 재생에너지 Curtailment  (MWh)',                    'RE_Curtailment_Timeseries',  '843C0C', False,  8),
+        ('7. 국가 전체 수요 현황  (전력/열/EV/Fab/DC, MW)',        'National_Loads',             '155F8A', False,  9),
     ]
+    # (sec_title, src_sheet, color, el_only, helper_col_idx)
 
-    row = 1
+    # 헬퍼 셀 작성 + BASE_REF 매핑
+    BASE_REF = {}   # src_sheet → '$X$3' 절대 참조 문자열
+    for _, src_sheet, _, _, hcol in SECTIONS_DEF:
+        if src_sheet not in wb.sheetnames:
+            continue
+        cl = get_column_letter(hcol)
+        ws.cell(HELPER_ROW, hcol,
+            f"=IFERROR(MATCH($B${INPUT_ROW},'{src_sheet}'!$A:$A,1),2)"
+        ).font = GRAY7
+        ws.cell(HELPER_ROW, hcol).fill = GRAY_FILL
+        BASE_REF[src_sheet] = f'${cl}${HELPER_ROW}'   # e.g. '$C$3'
 
-    # 타이틀 행
-    c = ws.cell(row, 1, '■ Analysis Window – 섹터커플링 운영 현황 분석')
-    c.font = Font(bold=True, size=13, color='1F4E79')
-    row += 1
+    # Row 4: 빈 행 (섹션 시작 전 여백)
+    row = 5
 
-    # 기간 정보 행
-    ws.cell(row, 1, '분석 시작').font = BOLD9
-    ws.cell(row, 2, start_dt.strftime('%Y-%m-%d %H:%M')).font = NORM9
-    ws.cell(row, 4, '분석 종료').font = BOLD9
-    ws.cell(row, 5, end_dt.strftime('%Y-%m-%d %H:%M')).font = NORM9
-    ws.cell(row, 7, '기간').font = BOLD9
-    ws.cell(row, 8, f'{len(idx)}h ({n_hours // 24}일)').font = NORM9
-    if auto_detected:
-        ws.cell(row, 10,
-                '※ 시작 시점은 선로 포화도 최대 구간을 자동 탐색하였습니다.'
-                ).font = Font(italic=True, color='FF0000', size=8)
-    row += 2
+    # ── 섹션 작성 ──────────────────────────────────────────────────
+    written_secs = 0
+    for sec_title, src_sheet, color_hex, el_only, _ in SECTIONS_DEF:
+        cols     = _src_cols(src_sheet, el_only=el_only)
+        base_ref = BASE_REF.get(src_sheet)
+        if not cols or not base_ref:
+            continue
 
-    def _write_section(ws, row, title, df, color_hex):
-        if df is None or df.empty:
-            return row
-        n_data_cols = df.shape[1]
-        fill_sec  = _fill(color_hex)
-        # ── 섹션 헤더 ──
-        c = ws.cell(row, 1, title)
-        c.font  = WHITE_BOLD
-        c.fill  = fill_sec
+        fill_sec = _fill(color_hex)
+        n_data   = len(cols)
+
+        # 섹션 헤더
+        c = ws.cell(row, 1, sec_title)
+        c.font = WHITE_BOLD; c.fill = fill_sec
         c.alignment = Alignment(horizontal='left', vertical='center')
-        for ci in range(2, n_data_cols + 2):
+        for ci in range(2, n_data + 2):
             ws.cell(row, ci).fill = fill_sec
         row += 1
-        # ── 컬럼 헤더 ──
-        c = ws.cell(row, 1, 'Timestamp')
-        c.font = BOLD9; c.fill = HEAD_FILL
-        for ci, col_name in enumerate(df.columns, start=2):
-            c = ws.cell(row, ci, str(col_name))
+
+        # 컬럼 헤더
+        ws.cell(row, 1, 'Timestamp').font = BOLD9
+        ws.cell(row, 1).fill = HEAD_FILL
+        for ci, (col_name, _) in enumerate(cols, start=2):
+            c = ws.cell(row, ci, col_name)
             c.font = BOLD9; c.fill = HEAD_FILL
         row += 1
-        # ── 데이터 행 ──
-        for ts, data_row in df.iterrows():
-            ws.cell(row, 1, str(ts)).font = NORM9
-            for ci, val in enumerate(data_row.values, start=2):
-                try:
-                    v = float(val)
-                    ws.cell(row, ci, 0 if _np.isnan(v) else round(v, 2)).font = NORM9
-                except Exception:
-                    ws.cell(row, ci, val).font = NORM9
-            row += 1
-        return row + 1  # 섹션 간 빈 행
 
-    for sec_title, sec_df, sec_color in SECTIONS:
-        row = _write_section(ws, row, sec_title, sec_df, sec_color)
+        DATA_START = row
 
-    # ── 열 너비 자동 조정 (최대 28) ──────────────────────────────
+        # ── 수식 행 (MAX_WIN = 336개) ──────────────────────────────
+        # 타임스탬프: INDEX(source!A, base_row + i)  ← 부동소수점 오차 없음
+        # 데이터:     INDEX(source!col, base_row + i)
+        for i in range(MAX_WIN):
+            r = DATA_START + i
+
+            # 타임스탬프 열
+            c_ts = ws.cell(r, 1,
+                f'=IF({i}>={HOURS_CELL},"",IFERROR(INDEX(\'{src_sheet}\'!$A:$A,{base_ref}+{i}),""))')
+            c_ts.number_format = DT_FMT
+            c_ts.font = NORM9
+
+            # 데이터 열
+            for ci, (_, src_col_idx) in enumerate(cols, start=2):
+                src_cl = get_column_letter(src_col_idx)
+                ws.cell(r, ci,
+                    f'=IF($A{r}="","",IFERROR(INDEX(\'{src_sheet}\'!${src_cl}:${src_cl},{base_ref}+{i}),0))'
+                ).font = NORM9
+
+        row = DATA_START + MAX_WIN + 1   # 다음 섹션 앞 빈 행 1개
+        written_secs += 1
+
+    # ── 열 너비 설정 ──────────────────────────────────────────────────
     try:
-        for col_cells in ws.columns:
-            col_letter = get_column_letter(col_cells[0].column)
-            max_len = max(
-                (len(str(cell.value)) for cell in col_cells if cell.value is not None),
-                default=8
-            )
-            ws.column_dimensions[col_letter].width = min(max_len + 2, 28)
+        ws.column_dimensions['A'].width = 20
+        ws.column_dimensions['B'].width = 20
+        ws.column_dimensions['C'].width = 10
+        ws.column_dimensions['D'].width = 10
+        ws.column_dimensions['E'].width = 8
+        ws.column_dimensions['F'].width = 16
+        ws.column_dimensions['G'].width = 20
+        ws.column_dimensions['H'].width = 6
+        ws.column_dimensions['I'].width = 55
     except Exception:
         pass
 
-    print(f"  → Analysis_Window 시트 완료: {len(idx)}개 시간대 × 6개 섹션")
+    print(f"  → Analysis_Window 완료: {written_secs}개 섹션 × {MAX_WIN}행 (INDEX+오프셋 수식)")
 
 
 def save_results(network, filename=None, subdir=None):
@@ -4132,6 +4113,27 @@ def save_results(network, filename=None, subdir=None):
                 print(f"Generator_Output 석탄 합산 경고: {_e_coal_agg}")
                 gtp.to_excel(writer, sheet_name='Generator_Output')
 
+            # 국가 단위 발전원별 합산 (National_Gen_Output)
+            try:
+                try:
+                    _src_gen = gtp_agg
+                except NameError:
+                    _src_gen = gtp
+                if not _src_gen.empty:
+                    _regions_set = {'BSN', 'CBD', 'CND', 'GBD', 'GGD', 'GND', 'GWD', 'ICN', 'JBD', 'JJD', 'JND'}
+                    _nat_gen: dict = {}
+                    for _c in _src_gen.columns:
+                        _sp = _c.split('_', 1)
+                        _k = _sp[1] if (len(_sp) == 2 and _sp[0] in _regions_set) else _c
+                        if _k in _nat_gen:
+                            _nat_gen[_k] = _nat_gen[_k] + _src_gen[_c]
+                        else:
+                            _nat_gen[_k] = _src_gen[_c].copy()
+                    pd.DataFrame(_nat_gen, index=_src_gen.index).to_excel(writer, sheet_name='National_Gen_Output')
+                    print(f"National_Gen_Output: {len(_nat_gen)}개 발전원 국가 합산 저장")
+            except Exception as _e_ng:
+                print(f"National_Gen_Output 경고: {_e_ng}")
+
             # AC 선로 조류 결과
             try:
                 if hasattr(network.lines_t, 'p0') and (not network.lines_t.p0.empty):
@@ -4155,6 +4157,23 @@ def save_results(network, filename=None, subdir=None):
             try:
                 if hasattr(network.links_t, 'p0') and (not network.links_t.p0.empty):
                     network.links_t.p0.to_excel(writer, sheet_name='Link_Flow')
+
+                    # 국가 단위 Link 흐름 합산 (National_Link_Flow)
+                    try:
+                        _src_lf = network.links_t.p0
+                        _regions_set = {'BSN', 'CBD', 'CND', 'GBD', 'GGD', 'GND', 'GWD', 'ICN', 'JBD', 'JJD', 'JND'}
+                        _nat_lf: dict = {}
+                        for _c in _src_lf.columns:
+                            _sp = _c.split('_', 1)
+                            _k = _sp[1] if (len(_sp) == 2 and _sp[0] in _regions_set) else _c
+                            if _k in _nat_lf:
+                                _nat_lf[_k] = _nat_lf[_k] + _src_lf[_c]
+                            else:
+                                _nat_lf[_k] = _src_lf[_c].copy()
+                        pd.DataFrame(_nat_lf, index=_src_lf.index).to_excel(writer, sheet_name='National_Link_Flow')
+                        print(f"National_Link_Flow: {len(_nat_lf)}개 링크 국가 합산 저장")
+                    except Exception as _e_nlf:
+                        print(f"National_Link_Flow 경고: {_e_nlf}")
             except Exception:
                 pass
 
@@ -4205,6 +4224,39 @@ def save_results(network, filename=None, subdir=None):
                     network.stores_t.p.to_excel(writer, sheet_name='Storage_Power')
                 if hasattr(network, 'stores_t') and (hasattr(network.stores_t, 'e') and (not network.stores_t.e.empty)):
                     network.stores_t.e.to_excel(writer, sheet_name='Storage_Energy')
+
+                # 국가 단위 Storage 합산 (National_Storage_Power / National_Storage_Energy)
+                _regions_set = {'BSN', 'CBD', 'CND', 'GBD', 'GGD', 'GND', 'GWD', 'ICN', 'JBD', 'JJD', 'JND'}
+                if hasattr(network, 'stores_t') and (not network.stores_t.p.empty):
+                    try:
+                        _src_sp = network.stores_t.p
+                        _nat_sp: dict = {}
+                        for _c in _src_sp.columns:
+                            _sp = _c.split('_', 1)
+                            _k = _sp[1] if (len(_sp) == 2 and _sp[0] in _regions_set) else _c
+                            if _k in _nat_sp:
+                                _nat_sp[_k] = _nat_sp[_k] + _src_sp[_c]
+                            else:
+                                _nat_sp[_k] = _src_sp[_c].copy()
+                        pd.DataFrame(_nat_sp, index=_src_sp.index).to_excel(writer, sheet_name='National_Storage_Power')
+                        print(f"National_Storage_Power: {len(_nat_sp)}개 저장장치 국가 합산 저장")
+                    except Exception as _e_nsp:
+                        print(f"National_Storage_Power 경고: {_e_nsp}")
+                if hasattr(network, 'stores_t') and (hasattr(network.stores_t, 'e') and (not network.stores_t.e.empty)):
+                    try:
+                        _src_se = network.stores_t.e
+                        _nat_se: dict = {}
+                        for _c in _src_se.columns:
+                            _sp = _c.split('_', 1)
+                            _k = _sp[1] if (len(_sp) == 2 and _sp[0] in _regions_set) else _c
+                            if _k in _nat_se:
+                                _nat_se[_k] = _nat_se[_k] + _src_se[_c]
+                            else:
+                                _nat_se[_k] = _src_se[_c].copy()
+                        pd.DataFrame(_nat_se, index=_src_se.index).to_excel(writer, sheet_name='National_Storage_Energy')
+                        print(f"National_Storage_Energy: {len(_nat_se)}개 저장장치 국가 합산 저장")
+                    except Exception as _e_nse:
+                        print(f"National_Storage_Energy 경고: {_e_nse}")
             except Exception:
                 pass
 
@@ -4233,6 +4285,53 @@ def save_results(network, filename=None, subdir=None):
                 else:
                     ltp = pd.DataFrame(index=network.snapshots)
                 ltp.to_excel(writer, sheet_name='Hourly_Loads')
+
+                # National_Loads: 국가 전체 수요 5종 합산 (전력 / 열 / EV / Fab / DC)
+                try:
+                    if ltp is not None and not ltp.empty:
+                        _nat_loads: dict = {}
+                        _ltp_cols = list(ltp.columns)
+
+                        # 전력수요: '_Demand_EL' 포함 or '_EL'로 끝나는 컬럼
+                        _el_cols  = [c for c in _ltp_cols
+                                     if '_Demand_EL' in str(c)
+                                     or (str(c).endswith('_EL') and '_Demand_' not in str(c))]
+                        # 열수요: '_Demand_H' 포함 (H2·EL·EV 제외)
+                        _ht_cols  = [c for c in _ltp_cols
+                                     if '_Demand_H' in str(c)
+                                     and '_H2' not in str(c)
+                                     and '_EL' not in str(c)
+                                     and '_EV' not in str(c)]
+                        # EV수요: '_Demand_EV' 포함 or '_EV'로 끝나는 컬럼
+                        _ev_cols  = [c for c in _ltp_cols
+                                     if '_Demand_EV' in str(c)
+                                     or (str(c).endswith('_EV') and '_Demand_' not in str(c))]
+                        # Fab 수요: '_Demand_Fab' 포함
+                        _fab_cols = [c for c in _ltp_cols if '_Demand_Fab' in str(c)]
+                        # DC 수요: '_Demand_DC' 포함
+                        _dc_cols  = [c for c in _ltp_cols if '_Demand_DC'  in str(c)]
+
+                        if _el_cols:
+                            _nat_loads['전력수요_MW']  = ltp[_el_cols].sum(axis=1)
+                        if _ht_cols:
+                            _nat_loads['열수요_MW']    = ltp[_ht_cols].sum(axis=1)
+                        if _ev_cols:
+                            _nat_loads['EV수요_MW']    = ltp[_ev_cols].sum(axis=1)
+                        if _fab_cols:
+                            _nat_loads['Fab수요_MW']   = ltp[_fab_cols].sum(axis=1)
+                        if _dc_cols:
+                            _nat_loads['DC수요_MW']    = ltp[_dc_cols].sum(axis=1)
+
+                        if _nat_loads:
+                            _nat_df = pd.DataFrame(_nat_loads, index=ltp.index)
+                            _nat_df.index.name = 'Timestamp'
+                            _nat_df.to_excel(writer, sheet_name='National_Loads')
+                            print(f"National_Loads: 국가 수요 {len(_nat_loads)}종 "
+                                  f"({list(_nat_loads.keys())}) 저장 완료")
+                        else:
+                            print("National_Loads: 합산 가능한 수요 컬럼 없음")
+                except Exception as _e_nl:
+                    print(f"National_Loads 경고: {_e_nl}")
             except Exception:
                 pass
 
