@@ -2529,13 +2529,22 @@ def create_network(input_data):
                     
                     print(f"   총 {len(network.rps_constraints)}개 RPS 제약 설정됨")
 
-            # 3) DC / Fab 재생에너지 시간별 조달 제약 (방법 B: 24/7 CFE)
-            # constraints 시트 type = 'DC_RE_CFE'  → DC 수요 중 RE 최소 비율
-            #                  type = 'Fab_RE_CFE' → Fab 수요 중 RE 최소 비율
+            # 3) DC / Fab 재생에너지 조달 관련 제약 파라미터 읽기
+            # constraints 시트 type = 'DC_RE_CFE'        → DC 수요 중 RE 최소 연간 비율
+            #                  type = 'FAB_RE_CFE'       → Fab 수요 중 RE 최소 연간 비율
+            #                  type = 'DC_FAB_LINK_SHARE'→ EL→RE 버스 백업링크 연간 허용 비율
             # constant 컬럼에 비율(0~1) 입력, region 컬럼은 무시(전국 합산 적용)
-            network.dc_fab_re_cfe = {'dc_share': 0.0, 'fab_share': 0.0, 'active': False}
+            network.dc_fab_re_cfe = {
+                'dc_share': 0.0, 'fab_share': 0.0,
+                'link_share': 0.0, 'active': False
+            }
             if 'type' in constraints_df.columns:
-                for _cfe_type, _cfe_key in [('DC_RE_CFE', 'dc_share'), ('FAB_RE_CFE', 'fab_share')]:
+                _cfe_types = [
+                    ('DC_RE_CFE',         'dc_share',   'DC RE 연간 비율'),
+                    ('FAB_RE_CFE',        'fab_share',  'Fab RE 연간 비율'),
+                    ('DC_FAB_LINK_SHARE', 'link_share', 'EL→RE 링크 연간 허용 비율'),
+                ]
+                for _cfe_type, _cfe_key, _cfe_label in _cfe_types:
                     _cfe_mask = constraints_df['type'].astype(str).str.strip().str.upper() == _cfe_type
                     _cfe_rows = _filter_by_year(constraints_df[_cfe_mask])
                     if not _cfe_rows.empty:
@@ -2547,13 +2556,13 @@ def create_network(input_data):
                         network.dc_fab_re_cfe[_cfe_key] = _share
                         if _share > 0:
                             network.dc_fab_re_cfe['active'] = True
-                        _label = 'DC' if _cfe_key == 'dc_share' else 'Fab'
-                        print(f"[CFE] {_label} 수요 RE 시간별 조달 비율: {_share*100:.1f}%"
+                        print(f"[CFE] {_cfe_label}: {_share*100:.1f}%"
                               + (" (비활성화)" if _share <= 0 else ""))
                 if network.dc_fab_re_cfe['active']:
-                    print(f"[CFE] DC/Fab RE 시간별 조달 제약 활성화됨 "
-                          f"(DC={network.dc_fab_re_cfe['dc_share']*100:.0f}%, "
-                          f"Fab={network.dc_fab_re_cfe['fab_share']*100:.0f}%)")
+                    print(f"[CFE] DC/Fab RE 조달 제약 활성화됨 → "
+                          f"DC_RE={network.dc_fab_re_cfe['dc_share']*100:.0f}%, "
+                          f"Fab_RE={network.dc_fab_re_cfe['fab_share']*100:.0f}%, "
+                          f"Link허용={network.dc_fab_re_cfe['link_share']*100:.0f}%")
         else:
             print("경고: constraints 시트가 없거나 비어있습니다.")
         
@@ -2890,94 +2899,164 @@ def optimize_network(network):
 
         def _dc_fab_re_cfe_constraint(n, sns):
             """
-            [방법 B – 연간 총량] DC·Fab 수요에 대한 재생에너지(PV+WT) 연간 총량 조달 제약
-            constraints 시트: type=DC_RE_CFE(dc_share), type=FAB_RE_CFE(fab_share) 로 비율 설정.
+            DC·Fab RE 조달 관련 제약 2종 (extra_functionality에서 호출)
 
-            연간(스냅샷 전체) 합산 기준:
-              Σ_t [snapshot_weight(t) × Σ_g RE_gen_p[g,t]]
-                ≥  dc_share × Σ_t [weight(t) × DC_demand(t)]
-                 + fab_share × Σ_t [weight(t) × Fab_demand(t)]
+            ① RE 연간 총량 제약 (dc_share / fab_share > 0 일 때)
+               Σ_t [w(t) × Σ_g RE_gen(g,t)]
+                 ≥ dc_share  × Σ_t [w(t) × DC_demand(t)]
+                 + fab_share × Σ_t [w(t) × Fab_demand(t)]
 
-            - RE 발전기: 이름에 'pv'/'solar'/'wt'/'wind' 키워드 포함 (대소문자 무관)
-            - ESS 제외 (RE 충전 여부 추적 불가)
-            - 단일 스칼라 제약 → infeasible 위험 없음, 비용 효율적
-            - DC·Fab 수요가 모두 0이거나 비율이 0이면 제약 추가 안 함
+            ② EL→RE 버스 백업링크 연간 총량 상한 (link_share > 0 일 때)
+               Σ_t [w(t) × Σ_lk link_flow(lk,t)]
+                 ≤ link_share × Σ_t [w(t) × RE버스수요(t)]
+               (RE 버스: EL 버스가 아닌 버스에 DC/Fab 부하가 있는 버스)
+
+            constraints 시트 설정:
+              type=DC_RE_CFE        → dc_share  (0~1)
+              type=FAB_RE_CFE       → fab_share (0~1)
+              type=DC_FAB_LINK_SHARE→ link_share(0~1)
             """
             try:
                 cfe_cfg = getattr(n, 'dc_fab_re_cfe', {})
                 if not cfe_cfg.get('active', False):
                     return
-                dc_share  = float(cfe_cfg.get('dc_share',  0.0))
-                fab_share = float(cfe_cfg.get('fab_share', 0.0))
-                if dc_share <= 0 and fab_share <= 0:
-                    return
 
-                # ── 1. RE 발전기 식별 ──────────────────────────────────────
-                _re_kw = ('pv', 'solar', 'wt', 'wind')
-                re_gens = [
-                    g for g in n.generators.index
-                    if any(kw in str(g).lower() for kw in _re_kw)
-                    and g in n.model.variables['Generator-p'].coords['Generator'].values
-                ]
-                if not re_gens:
-                    print("[CFE] 경고: RE 발전기를 찾을 수 없어 DC/Fab RE 제약 건너뜀")
-                    return
+                dc_share   = float(cfe_cfg.get('dc_share',   0.0))
+                fab_share  = float(cfe_cfg.get('fab_share',  0.0))
+                link_share = float(cfe_cfg.get('link_share', 0.0))
 
-                # ── 2. 스냅샷 가중치 확보 ──────────────────────────────────
                 import pandas as _pd
                 import xarray as _xr
+
+                # ── 공통: 스냅샷 가중치 ────────────────────────────────────
                 weights = n.snapshot_weightings['generators'].reindex(sns).fillna(1.0)
                 weights_da = _xr.DataArray(weights.values,
                                            coords={'snapshot': sns},
                                            dims=['snapshot'])
 
-                # ── 3. RE 연간 발전량 (linopy 변수 합산) ───────────────────
-                # Generator-p 변수에 가중치 곱 → 연간 합산 스칼라 linopy 식
-                re_p_var = n.model.variables['Generator-p'].sel(Generator=re_gens)
-                # (snapshot × Generator) × weight → snapshot 축 합산
-                re_annual = (re_p_var * weights_da).sum()   # 스칼라 linopy 식
+                # ── 공통: 부하 소스 선택 ───────────────────────────────────
+                _src = None
+                if (hasattr(n.loads_t, 'p') and n.loads_t.p is not None
+                        and not n.loads_t.p.empty):
+                    _src = n.loads_t.p
+                elif (hasattr(n.loads_t, 'p_set') and n.loads_t.p_set is not None
+                      and not n.loads_t.p_set.empty):
+                    _src = n.loads_t.p_set
 
-                # ── 4. DC · Fab 수요 연간 총량 (고정 파라미터) ────────────
-                def _annual_demand(keyword):
-                    """keyword 포함 부하 시계열 × 가중치 합산 → 스칼라 float"""
+                def _annual_load(keyword):
+                    """keyword 포함 모든 부하의 연간 가중 합산 → float (MWh)"""
                     total = 0.0
-                    src = None
-                    if (hasattr(n.loads_t, 'p') and n.loads_t.p is not None
-                            and not n.loads_t.p.empty):
-                        src = n.loads_t.p
-                    elif (hasattr(n.loads_t, 'p_set') and n.loads_t.p_set is not None
-                          and not n.loads_t.p_set.empty):
-                        src = n.loads_t.p_set
-                    if src is None:
+                    if _src is None:
                         return total
-                    for col in src.columns:
+                    for col in _src.columns:
                         if keyword in str(col).lower():
-                            series = src[col].reindex(sns).fillna(0.0)
-                            total += float((series * weights).sum())
+                            total += float((_src[col].reindex(sns).fillna(0.0) * weights).sum())
                     return total
 
-                dc_annual  = _annual_demand('_demand_dc')
-                fab_annual = _annual_demand('_demand_fab')
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # ① RE 연간 총량 제약
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                if dc_share > 0 or fab_share > 0:
+                    _re_kw = ('pv', 'solar', 'wt', 'wind')
+                    re_gens = [
+                        g for g in n.generators.index
+                        if any(kw in str(g).lower() for kw in _re_kw)
+                        and g in n.model.variables['Generator-p'].coords['Generator'].values
+                    ]
+                    if not re_gens:
+                        print("[CFE①] 경고: RE 발전기를 찾을 수 없어 RE 연간 제약 건너뜀")
+                    else:
+                        re_p_var   = n.model.variables['Generator-p'].sel(Generator=re_gens)
+                        re_annual  = (re_p_var * weights_da).sum()
 
-                # ── 5. 우변(필요 RE 최소 연간 발전량) 계산 ────────────────
-                required_annual = dc_share * dc_annual + fab_share * fab_annual
+                        dc_annual  = _annual_load('_demand_dc')
+                        fab_annual = _annual_load('_demand_fab')
+                        req_annual = dc_share * dc_annual + fab_share * fab_annual
 
-                if required_annual <= 0:
-                    print("[CFE] DC/Fab 연간 수요 합계가 0 → 제약 건너뜀")
-                    return
+                        if req_annual > 0:
+                            n.model.add_constraints(
+                                re_annual >= req_annual,
+                                name='DC_Fab_RE_Annual'
+                            )
+                            print(f"[CFE①] RE 연간 총량 제약 추가 완료")
+                            print(f"       RE발전기 {len(re_gens)}개 | "
+                                  f"DC={dc_annual/1e6:.2f}TWh×{dc_share*100:.0f}% + "
+                                  f"Fab={fab_annual/1e6:.2f}TWh×{fab_share*100:.0f}% "
+                                  f"→ 필요 RE≥{req_annual/1e6:.2f}TWh")
+                        else:
+                            print("[CFE①] DC/Fab 연간 수요 합계가 0 → RE 연간 제약 건너뜀")
 
-                # ── 6. 스칼라 제약 추가 ────────────────────────────────────
-                n.model.add_constraints(
-                    re_annual >= required_annual,
-                    name='DC_Fab_RE_Annual'
-                )
-                print(f"[CFE] DC/Fab RE 연간 총량 제약 추가 완료")
-                print(f"      RE 발전기: {len(re_gens)}개")
-                print(f"      DC 연간={dc_annual/1e6:.2f}TWh × {dc_share*100:.0f}% = "
-                      f"{dc_annual*dc_share/1e6:.2f}TWh")
-                print(f"      Fab 연간={fab_annual/1e6:.2f}TWh × {fab_share*100:.0f}% = "
-                      f"{fab_annual*fab_share/1e6:.2f}TWh")
-                print(f"      → 필요 RE 연간 발전량 ≥ {required_annual/1e6:.2f}TWh")
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # ② EL→RE 버스 백업링크 연간 총량 상한 제약
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                if link_share > 0:
+                    try:
+                        if 'Link-p' not in n.model.variables:
+                            print("[CFE②] Link-p 변수 없음 → 링크 제약 건너뜀")
+                        else:
+                            link_var_names = set(
+                                n.model.variables['Link-p'].coords['Link'].values)
+
+                            # DC/Fab 전용 RE 버스 탐색
+                            # (EL 버스가 아닌 버스에 _demand_dc 또는 _demand_fab 부하 있는 경우)
+                            re_dc_fab_buses = set()
+                            if _src is not None:
+                                for _col in _src.columns:
+                                    _col_lo = str(_col).lower()
+                                    if '_demand_dc' in _col_lo or '_demand_fab' in _col_lo:
+                                        if _col in n.loads.index:
+                                            _bus = str(n.loads.at[_col, 'bus'])
+                                            if not _bus.endswith('_EL'):
+                                                re_dc_fab_buses.add(_bus)
+
+                            if not re_dc_fab_buses:
+                                print("[CFE②] DC/Fab RE 전용 버스를 찾을 수 없음 → 링크 제약 건너뜀")
+                            else:
+                                # 해당 버스로 유입되는 링크 (bus1 ∈ re_dc_fab_buses)
+                                backup_links = [
+                                    lk for lk in n.links.index
+                                    if str(n.links.at[lk, 'bus1']) in re_dc_fab_buses
+                                    and lk in link_var_names
+                                ]
+
+                                if not backup_links:
+                                    print(f"[CFE②] RE 버스({re_dc_fab_buses}) 유입 링크 없음 → 건너뜀")
+                                else:
+                                    # 링크 연간 유량 합산
+                                    link_p_var   = n.model.variables['Link-p'].sel(
+                                        Link=backup_links)
+                                    link_annual  = (link_p_var * weights_da).sum()
+
+                                    # RE 버스의 연간 총수요
+                                    re_bus_demand = 0.0
+                                    if _src is not None:
+                                        for _col in _src.columns:
+                                            if _col in n.loads.index:
+                                                if str(n.loads.at[_col, 'bus']) in re_dc_fab_buses:
+                                                    re_bus_demand += float(
+                                                        (_src[_col].reindex(sns).fillna(0.0)
+                                                         * weights).sum())
+
+                                    max_link_annual = link_share * re_bus_demand
+
+                                    if max_link_annual <= 0:
+                                        print("[CFE②] RE 버스 수요가 0 → 링크 제약 건너뜀")
+                                    else:
+                                        n.model.add_constraints(
+                                            link_annual <= max_link_annual,
+                                            name='DC_Fab_Link_Annual_Share'
+                                        )
+                                        print(f"[CFE②] EL→RE 링크 연간 총량 제약 추가 완료")
+                                        print(f"       대상 링크: {backup_links}")
+                                        print(f"       RE 버스 연간 수요: {re_bus_demand/1e6:.2f}TWh")
+                                        print(f"       허용 최대 링크 유량: "
+                                              f"{max_link_annual/1e6:.2f}TWh "
+                                              f"({link_share*100:.0f}%)")
+                    except Exception as _e_lk:
+                        print(f"[CFE②] 링크 연간 총량 제약 오류: {_e_lk}")
+                        import traceback as _tb2
+                        _tb2.print_exc()
+
             except Exception as _e_cfe:
                 print(f"[CFE] DC/Fab RE 제약 추가 오류: {_e_cfe}")
                 import traceback as _tb
