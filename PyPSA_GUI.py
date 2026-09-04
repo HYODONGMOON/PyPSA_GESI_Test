@@ -2884,14 +2884,17 @@ def optimize_network(network):
 
         def _dc_fab_re_cfe_constraint(n, sns):
             """
-            [방법 B] DC·Fab 수요에 대한 재생에너지(PV+WT) 시간별 조달 제약 (24/7 CFE)
+            [방법 B – 연간 총량] DC·Fab 수요에 대한 재생에너지(PV+WT) 연간 총량 조달 제약
             constraints 시트: type=DC_RE_CFE(dc_share), type=FAB_RE_CFE(fab_share) 로 비율 설정.
 
-            매 시간 t마다:
-              Σ_g RE_gen_p[g, t]  ≥  dc_share × DC_demand[t]  +  fab_share × Fab_demand[t]
+            연간(스냅샷 전체) 합산 기준:
+              Σ_t [snapshot_weight(t) × Σ_g RE_gen_p[g,t]]
+                ≥  dc_share × Σ_t [weight(t) × DC_demand(t)]
+                 + fab_share × Σ_t [weight(t) × Fab_demand(t)]
 
             - RE 발전기: 이름에 'pv'/'solar'/'wt'/'wind' 키워드 포함 (대소문자 무관)
-            - ESS는 의도적으로 제외 (RE 충전 여부 추적 불가)
+            - ESS 제외 (RE 충전 여부 추적 불가)
+            - 단일 스칼라 제약 → infeasible 위험 없음, 비용 효율적
             - DC·Fab 수요가 모두 0이거나 비율이 0이면 제약 추가 안 함
             """
             try:
@@ -2914,16 +2917,24 @@ def optimize_network(network):
                     print("[CFE] 경고: RE 발전기를 찾을 수 없어 DC/Fab RE 제약 건너뜀")
                     return
 
-                re_p_var = n.model.variables['Generator-p'].sel(Generator=re_gens)
-                re_total = re_p_var.sum(dim='Generator')   # xarray DataArray (snapshot,)
-
-                # ── 2. DC · Fab 수요 시계열 (고정 파라미터) ───────────────
+                # ── 2. 스냅샷 가중치 확보 ──────────────────────────────────
                 import pandas as _pd
-                _re_kw_load = ('_demand_dc', '_demand_fab')
+                import xarray as _xr
+                weights = n.snapshot_weightings['generators'].reindex(sns).fillna(1.0)
+                weights_da = _xr.DataArray(weights.values,
+                                           coords={'snapshot': sns},
+                                           dims=['snapshot'])
 
-                def _sum_load_series(keyword):
-                    """keyword를 포함하는 부하 시계열 합산 → sns 인덱스 기준 Series"""
-                    total = _pd.Series(0.0, index=sns)
+                # ── 3. RE 연간 발전량 (linopy 변수 합산) ───────────────────
+                # Generator-p 변수에 가중치 곱 → 연간 합산 스칼라 linopy 식
+                re_p_var = n.model.variables['Generator-p'].sel(Generator=re_gens)
+                # (snapshot × Generator) × weight → snapshot 축 합산
+                re_annual = (re_p_var * weights_da).sum()   # 스칼라 linopy 식
+
+                # ── 4. DC · Fab 수요 연간 총량 (고정 파라미터) ────────────
+                def _annual_demand(keyword):
+                    """keyword 포함 부하 시계열 × 가중치 합산 → 스칼라 float"""
+                    total = 0.0
                     src = None
                     if (hasattr(n.loads_t, 'p') and n.loads_t.p is not None
                             and not n.loads_t.p.empty):
@@ -2935,40 +2946,32 @@ def optimize_network(network):
                         return total
                     for col in src.columns:
                         if keyword in str(col).lower():
-                            total = total.add(
-                                src[col].reindex(sns).fillna(0.0), fill_value=0.0)
+                            series = src[col].reindex(sns).fillna(0.0)
+                            total += float((series * weights).sum())
                     return total
 
-                dc_demand  = _sum_load_series('_demand_dc')
-                fab_demand = _sum_load_series('_demand_fab')
+                dc_annual  = _annual_demand('_demand_dc')
+                fab_annual = _annual_demand('_demand_fab')
 
-                # ── 3. 우변(필요 RE 최소량) 계산 ──────────────────────────
-                required = (dc_share * dc_demand + fab_share * fab_demand)
+                # ── 5. 우변(필요 RE 최소 연간 발전량) 계산 ────────────────
+                required_annual = dc_share * dc_annual + fab_share * fab_annual
 
-                if required.sum() <= 0:
-                    print("[CFE] DC/Fab 수요 합계가 0 → 제약 건너뜀")
+                if required_annual <= 0:
+                    print("[CFE] DC/Fab 연간 수요 합계가 0 → 제약 건너뜀")
                     return
 
-                # xarray DataArray로 변환 (linopy 제약에 사용)
-                import xarray as _xr
-                required_da = _xr.DataArray(required.values,
-                                            coords={'snapshot': sns},
-                                            dims=['snapshot'])
-
-                # ── 4. 제약 추가 ────────────────────────────────────────────
+                # ── 6. 스칼라 제약 추가 ────────────────────────────────────
                 n.model.add_constraints(
-                    re_total >= required_da,
-                    name='DC_Fab_RE_CFE'
+                    re_annual >= required_annual,
+                    name='DC_Fab_RE_Annual'
                 )
-                total_re_gens = len(re_gens)
-                dc_ann  = dc_demand.sum()
-                fab_ann = fab_demand.sum()
-                req_ann = required.sum()
-                print(f"[CFE] DC/Fab RE 시간별 제약 추가 완료")
-                print(f"      RE 발전기: {total_re_gens}개 | "
-                      f"DC 연간={dc_ann/1e6:.2f}TWh × {dc_share*100:.0f}% | "
-                      f"Fab 연간={fab_ann/1e6:.2f}TWh × {fab_share*100:.0f}% | "
-                      f"필요 RE 연간≥{req_ann/1e6:.2f}TWh")
+                print(f"[CFE] DC/Fab RE 연간 총량 제약 추가 완료")
+                print(f"      RE 발전기: {len(re_gens)}개")
+                print(f"      DC 연간={dc_annual/1e6:.2f}TWh × {dc_share*100:.0f}% = "
+                      f"{dc_annual*dc_share/1e6:.2f}TWh")
+                print(f"      Fab 연간={fab_annual/1e6:.2f}TWh × {fab_share*100:.0f}% = "
+                      f"{fab_annual*fab_share/1e6:.2f}TWh")
+                print(f"      → 필요 RE 연간 발전량 ≥ {required_annual/1e6:.2f}TWh")
             except Exception as _e_cfe:
                 print(f"[CFE] DC/Fab RE 제약 추가 오류: {_e_cfe}")
                 import traceback as _tb
