@@ -2522,6 +2522,32 @@ def create_network(input_data):
                             print(f"   [경고]  RPS 제약 '{rps_row.get('name', 'Unknown')}' 추가 실패: {str(e)}")
                     
                     print(f"   총 {len(network.rps_constraints)}개 RPS 제약 설정됨")
+
+            # 3) DC / Fab 재생에너지 시간별 조달 제약 (방법 B: 24/7 CFE)
+            # constraints 시트 type = 'DC_RE_CFE'  → DC 수요 중 RE 최소 비율
+            #                  type = 'Fab_RE_CFE' → Fab 수요 중 RE 최소 비율
+            # constant 컬럼에 비율(0~1) 입력, region 컬럼은 무시(전국 합산 적용)
+            network.dc_fab_re_cfe = {'dc_share': 0.0, 'fab_share': 0.0, 'active': False}
+            if 'type' in constraints_df.columns:
+                for _cfe_type, _cfe_key in [('DC_RE_CFE', 'dc_share'), ('FAB_RE_CFE', 'fab_share')]:
+                    _cfe_mask = constraints_df['type'].astype(str).str.strip().str.upper() == _cfe_type
+                    _cfe_rows = _filter_by_year(constraints_df[_cfe_mask])
+                    if not _cfe_rows.empty:
+                        _share = float(pd.to_numeric(
+                            _cfe_rows.iloc[0].get('constant', 0.0), errors='coerce'))
+                        if pd.isna(_share):
+                            _share = 0.0
+                        _share = max(0.0, min(1.0, _share))
+                        network.dc_fab_re_cfe[_cfe_key] = _share
+                        if _share > 0:
+                            network.dc_fab_re_cfe['active'] = True
+                        _label = 'DC' if _cfe_key == 'dc_share' else 'Fab'
+                        print(f"[CFE] {_label} 수요 RE 시간별 조달 비율: {_share*100:.1f}%"
+                              + (" (비활성화)" if _share <= 0 else ""))
+                if network.dc_fab_re_cfe['active']:
+                    print(f"[CFE] DC/Fab RE 시간별 조달 제약 활성화됨 "
+                          f"(DC={network.dc_fab_re_cfe['dc_share']*100:.0f}%, "
+                          f"Fab={network.dc_fab_re_cfe['fab_share']*100:.0f}%)")
         else:
             print("경고: constraints 시트가 없거나 비어있습니다.")
         
@@ -2856,6 +2882,98 @@ def optimize_network(network):
             # → extra_functionality에서 추가 작업 불필요
             pass
 
+        def _dc_fab_re_cfe_constraint(n, sns):
+            """
+            [방법 B] DC·Fab 수요에 대한 재생에너지(PV+WT) 시간별 조달 제약 (24/7 CFE)
+            constraints 시트: type=DC_RE_CFE(dc_share), type=FAB_RE_CFE(fab_share) 로 비율 설정.
+
+            매 시간 t마다:
+              Σ_g RE_gen_p[g, t]  ≥  dc_share × DC_demand[t]  +  fab_share × Fab_demand[t]
+
+            - RE 발전기: 이름에 'pv'/'solar'/'wt'/'wind' 키워드 포함 (대소문자 무관)
+            - ESS는 의도적으로 제외 (RE 충전 여부 추적 불가)
+            - DC·Fab 수요가 모두 0이거나 비율이 0이면 제약 추가 안 함
+            """
+            try:
+                cfe_cfg = getattr(n, 'dc_fab_re_cfe', {})
+                if not cfe_cfg.get('active', False):
+                    return
+                dc_share  = float(cfe_cfg.get('dc_share',  0.0))
+                fab_share = float(cfe_cfg.get('fab_share', 0.0))
+                if dc_share <= 0 and fab_share <= 0:
+                    return
+
+                # ── 1. RE 발전기 식별 ──────────────────────────────────────
+                _re_kw = ('pv', 'solar', 'wt', 'wind')
+                re_gens = [
+                    g for g in n.generators.index
+                    if any(kw in str(g).lower() for kw in _re_kw)
+                    and g in n.model.variables['Generator-p'].coords['Generator'].values
+                ]
+                if not re_gens:
+                    print("[CFE] 경고: RE 발전기를 찾을 수 없어 DC/Fab RE 제약 건너뜀")
+                    return
+
+                re_p_var = n.model.variables['Generator-p'].sel(Generator=re_gens)
+                re_total = re_p_var.sum(dim='Generator')   # xarray DataArray (snapshot,)
+
+                # ── 2. DC · Fab 수요 시계열 (고정 파라미터) ───────────────
+                import pandas as _pd
+                _re_kw_load = ('_demand_dc', '_demand_fab')
+
+                def _sum_load_series(keyword):
+                    """keyword를 포함하는 부하 시계열 합산 → sns 인덱스 기준 Series"""
+                    total = _pd.Series(0.0, index=sns)
+                    src = None
+                    if (hasattr(n.loads_t, 'p') and n.loads_t.p is not None
+                            and not n.loads_t.p.empty):
+                        src = n.loads_t.p
+                    elif (hasattr(n.loads_t, 'p_set') and n.loads_t.p_set is not None
+                          and not n.loads_t.p_set.empty):
+                        src = n.loads_t.p_set
+                    if src is None:
+                        return total
+                    for col in src.columns:
+                        if keyword in str(col).lower():
+                            total = total.add(
+                                src[col].reindex(sns).fillna(0.0), fill_value=0.0)
+                    return total
+
+                dc_demand  = _sum_load_series('_demand_dc')
+                fab_demand = _sum_load_series('_demand_fab')
+
+                # ── 3. 우변(필요 RE 최소량) 계산 ──────────────────────────
+                required = (dc_share * dc_demand + fab_share * fab_demand)
+
+                if required.sum() <= 0:
+                    print("[CFE] DC/Fab 수요 합계가 0 → 제약 건너뜀")
+                    return
+
+                # xarray DataArray로 변환 (linopy 제약에 사용)
+                import xarray as _xr
+                required_da = _xr.DataArray(required.values,
+                                            coords={'snapshot': sns},
+                                            dims=['snapshot'])
+
+                # ── 4. 제약 추가 ────────────────────────────────────────────
+                n.model.add_constraints(
+                    re_total >= required_da,
+                    name='DC_Fab_RE_CFE'
+                )
+                total_re_gens = len(re_gens)
+                dc_ann  = dc_demand.sum()
+                fab_ann = fab_demand.sum()
+                req_ann = required.sum()
+                print(f"[CFE] DC/Fab RE 시간별 제약 추가 완료")
+                print(f"      RE 발전기: {total_re_gens}개 | "
+                      f"DC 연간={dc_ann/1e6:.2f}TWh × {dc_share*100:.0f}% | "
+                      f"Fab 연간={fab_ann/1e6:.2f}TWh × {fab_share*100:.0f}% | "
+                      f"필요 RE 연간≥{req_ann/1e6:.2f}TWh")
+            except Exception as _e_cfe:
+                print(f"[CFE] DC/Fab RE 제약 추가 오류: {_e_cfe}")
+                import traceback as _tb
+                _tb.print_exc()
+
         # RPS 제약조건 적용 (최적화 전 모델에 추가) - 임시 비활성화
         if False:  # hasattr(network, 'rps_constraints') and network.rps_constraints:
             print("\n[RE] RPS 제약조건을 모델에 추가 중...")
@@ -3127,10 +3245,11 @@ def optimize_network(network):
                         print(f"  [경고] CHP CO2 통합제약 추가 실패: {e_co2}")
 
                 def _combined_extra_functionality(n, sns):
-                    """DR 연간 한도 + 선로 유연 운영 + CHP CO2 통합"""
+                    """DR 연간 한도 + 선로 유연 운영 + CHP CO2 통합 + DC/Fab RE 시간별 조달"""
                     _dr_annual_hours_constraint(n, sns)
                     _line_flex_constraint(n, sns)
                     _chp_co2_constraint(n, sns)
+                    _dc_fab_re_cfe_constraint(n, sns)
 
                 status = network.optimize(
                     solver_name=active_solver,
