@@ -1383,10 +1383,16 @@ def create_network(input_data):
             for _, gen in input_data['generators'].iterrows():
                 gen_name = str(gen['name'])
                 p_nom_value = float(gen['p_nom'])
-                
-                # p_nom이 0인 경우 건너뛰기
-                if p_nom_value <= 0:
-                    print(f"발전기 {gen_name} 건너뜀: p_nom이 0 이하 ({p_nom_value})")
+
+                # p_nom_extendable 여부 먼저 확인
+                _extendable_raw = gen.get('p_nom_extendable', False)
+                _is_extendable = _to_bool(_extendable_raw) if pd.notna(_extendable_raw) else False
+
+                # p_nom이 0 이하인 경우:
+                #   - p_nom_extendable=True  → 용량 최적화 대상이므로 추가 허용
+                #   - p_nom_extendable=False → 기여 불가, 건너뜀
+                if p_nom_value <= 0 and not _is_extendable:
+                    print(f"발전기 {gen_name} 건너뜀: p_nom이 0 이하이고 확장 불가 ({p_nom_value})")
                     continue
                 
                 raw_bus = str(gen['bus'])
