@@ -2997,17 +2997,17 @@ def optimize_network(network):
                             link_var_names = set(
                                 n.model.variables['Link-p'].coords['Link'].values)
 
-                            # DC/Fab 전용 RE 버스 탐색
-                            # (EL 버스가 아닌 버스에 _demand_dc 또는 _demand_fab 부하 있는 경우)
+                            # ── DC/Fab 전용 RE 버스 탐색 ──────────────────────
+                            # n.loads.index 전체 스캔 (정적·시계열 부하 모두 포함)
                             re_dc_fab_buses = set()
-                            if _src is not None:
-                                for _col in _src.columns:
-                                    _col_lo = str(_col).lower()
-                                    if '_demand_dc' in _col_lo or '_demand_fab' in _col_lo:
-                                        if _col in n.loads.index:
-                                            _bus = str(n.loads.at[_col, 'bus'])
-                                            if not _bus.endswith('_EL'):
-                                                re_dc_fab_buses.add(_bus)
+                            for _lname in n.loads.index:
+                                _lname_lo = str(_lname).lower()
+                                if '_demand_dc' in _lname_lo or '_demand_fab' in _lname_lo:
+                                    _bus = str(n.loads.at[_lname, 'bus'])
+                                    if not _bus.endswith('_EL'):
+                                        re_dc_fab_buses.add(_bus)
+
+                            print(f"[CFE②] RE 전용 버스 탐색 결과: {re_dc_fab_buses}")
 
                             if not re_dc_fab_buses:
                                 print("[CFE②] DC/Fab RE 전용 버스를 찾을 수 없음 → 링크 제약 건너뜀")
@@ -3027,15 +3027,25 @@ def optimize_network(network):
                                         Link=backup_links)
                                     link_annual  = (link_p_var * weights_da).sum()
 
-                                    # RE 버스의 연간 총수요
+                                    # ── RE 버스의 연간 총수요 ────────────────
+                                    # n.loads 전체 기준: 시계열 있으면 시계열, 없으면 정적 p_set
                                     re_bus_demand = 0.0
-                                    if _src is not None:
-                                        for _col in _src.columns:
-                                            if _col in n.loads.index:
-                                                if str(n.loads.at[_col, 'bus']) in re_dc_fab_buses:
-                                                    re_bus_demand += float(
-                                                        (_src[_col].reindex(sns).fillna(0.0)
-                                                         * weights).sum())
+                                    for _lname in n.loads.index:
+                                        if str(n.loads.at[_lname, 'bus']) not in re_dc_fab_buses:
+                                            continue
+                                        # 시계열 부하
+                                        if (_src is not None and _lname in _src.columns):
+                                            re_bus_demand += float(
+                                                (_src[_lname].reindex(sns).fillna(0.0)
+                                                 * weights).sum())
+                                        # 정적 부하 (loads_t에 없는 경우)
+                                        else:
+                                            try:
+                                                _static_p = float(
+                                                    n.loads.at[_lname, 'p_set'] or 0.0)
+                                                re_bus_demand += _static_p * float(weights.sum())
+                                            except Exception:
+                                                pass
 
                                     max_link_annual = link_share * re_bus_demand
 
