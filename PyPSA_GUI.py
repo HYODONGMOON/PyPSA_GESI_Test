@@ -315,7 +315,13 @@ def _read_dc_fab_from_interface(interface_path, existing_load_names):
                     continue
                 v = str(row[0]).strip()
 
-                if v == 'Demand_DC' and dc_load_name not in existing_load_names:
+                # 접두어 방식으로 중복 검사:
+                # BSN_Demand_DC, BSN_Demand_DC_RE, BSN_Demand_DC_EL 등
+                # 모두 'BSN_Demand_DC'로 시작하면 이미 존재하는 것으로 간주
+                _dc_exists  = any(n.startswith(dc_load_name)  for n in existing_load_names)
+                _fab_exists = any(n.startswith(fab_load_name) for n in existing_load_names)
+
+                if v == 'Demand_DC' and not _dc_exists:
                     bus  = str(row[1]).strip() if (len(row) > 1 and row[1]) else f"{region}_EL"
                     pset = 0.0
                     if len(row) > 3 and row[3] is not None:
@@ -328,7 +334,7 @@ def _read_dc_fab_from_interface(interface_path, existing_load_names):
                         'bus': bus, 'carrier': 'electricity', 'p_set': pset
                     })
 
-                elif v == 'Demand_Fab' and fab_load_name not in existing_load_names:
+                elif v == 'Demand_Fab' and not _fab_exists:
                     bus  = str(row[1]).strip() if (len(row) > 1 and row[1]) else f"{region}_EL"
                     pset = 0.0
                     if len(row) > 3 and row[3] is not None:
