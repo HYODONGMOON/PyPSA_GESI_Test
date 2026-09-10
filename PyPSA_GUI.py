@@ -1277,14 +1277,19 @@ def create_network(input_data):
         
         # carriers 정의 (PyPSA 내부 배출계수 활용)
         # 주의: PyPSA는 type="primary_energy"로 (전력량/efficiency) × co2_emissions 계산
-        # 배출계수는 전력량 기준이므로, carrier.co2_emissions = 전력량기준배출계수 × 대표efficiency
-        # 예: 석탄 0.8384 tCO2/MWh_electric × 0.47 efficiency = 0.39405 tCO2/MWh_fuel
+        # carrier.co2_emissions 단위 = tCO2/MWh_fuel (연료 기준)
+        # 설정 방식: 목표 전력량기준배출계수 × 대표efficiency → 연료기준 배출계수로 변환
+        #   - Coal: 0.8384 tCO2/MWh_elec × 0.43(Coal_DB 평균효율) = 0.3605 tCO2/MWh_fuel
+        #   - LNG:  0.38   tCO2/MWh_elec × 0.55(LNG 모델효율)     = 0.2090 tCO2/MWh_fuel
+        # 결과 출력 배출계수 = carrier.co2_emissions / 발전기실제효율
+        #   → Coal: 실제 평균효율이 0.43과 다르면 가중평균 배출계수도 달라짐 (물리적으로 정상)
+        #   → LNG:  모든 LNG 발전기 효율 = 0.55 가정 시 정확히 0.38 출력
         carriers = {
             'AC': {'name': 'AC', 'co2_emissions': 0},
             'DC': {'name': 'DC', 'co2_emissions': 0},
             'electricity': {'name': 'electricity', 'co2_emissions': 0},
-            'coal': {'name': 'coal', 'co2_emissions': 0.73 * 0.47},  # 석탄 전력량기준 × 평균효율0.47
-            'gas': {'name': 'gas', 'co2_emissions': 0.33 * 0.53},     # LNG 전력량기준 × 평균효율0.53
+            'coal': {'name': 'coal', 'co2_emissions': 0.8384 * 0.43},  # 석탄: 0.8384 tCO2/MWh_e × 평균효율0.43
+            'gas': {'name': 'gas', 'co2_emissions': 0.38 * 0.55},      # LNG:  0.38   tCO2/MWh_e × 모델효율0.55
             'nuclear': {'name': 'nuclear', 'co2_emissions': 0},
             'solar': {'name': 'solar', 'co2_emissions': 0},
             'wind': {'name': 'wind', 'co2_emissions': 0},
