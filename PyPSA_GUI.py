@@ -1376,10 +1376,18 @@ def create_network(input_data):
                     pattern_values = pd.to_numeric(data_rows.iloc[:, col_idx], errors='coerce').dropna().values
                     
                     if len(pattern_values) > 0:
-                        pattern = normalize_pattern(pattern_values)
+                        # PV·WT 패턴은 정규화 없이 원본값 사용
+                        # → 엑셀에서 패턴 전체에 스케일(예: ×0.84)을 적용하면 발전량도 동일 비율 감소
+                        # 기타 패턴은 기존대로 최댓값=1 로 정규화
+                        _is_re_pattern = ('PV' in pattern_name or 'WT' in pattern_name)
+                        if _is_re_pattern:
+                            pattern = pattern_values.copy()  # 정규화 생략
+                        else:
+                            pattern = normalize_pattern(pattern_values)
                         pattern = adjust_pattern_length(pattern, snapshots_length)
                         renewable_patterns[pattern_name] = pattern
-                        print(f"  [{pattern_name}] 로드 완료 - 길이: {len(pattern)}, 최대: {np.max(pattern):.3f}, 최소: {np.min(pattern):.3f}")
+                        _norm_note = "원본값(정규화 생략)" if _is_re_pattern else "최댓값 정규화"
+                        print(f"  [{pattern_name}] 로드 완료 - 길이: {len(pattern)}, 최대: {np.max(pattern):.3f}, 합계: {np.sum(pattern):.3f} ({_norm_note})")
             
             if not renewable_patterns:
                 print("[경고] 재생에너지 패턴을 찾을 수 없습니다. 기본값 1.0을 사용합니다.")
