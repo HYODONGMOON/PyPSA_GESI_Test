@@ -1376,18 +1376,10 @@ def create_network(input_data):
                     pattern_values = pd.to_numeric(data_rows.iloc[:, col_idx], errors='coerce').dropna().values
                     
                     if len(pattern_values) > 0:
-                        # PV·WT 패턴은 정규화 없이 원본값 사용
-                        # → 엑셀에서 패턴 전체에 스케일(예: ×0.84)을 적용하면 발전량도 동일 비율 감소
-                        # 기타 패턴은 기존대로 최댓값=1 로 정규화
-                        _is_re_pattern = ('PV' in pattern_name or 'WT' in pattern_name)
-                        if _is_re_pattern:
-                            pattern = pattern_values.copy()  # 정규화 생략
-                        else:
-                            pattern = normalize_pattern(pattern_values)
+                        pattern = normalize_pattern(pattern_values)
                         pattern = adjust_pattern_length(pattern, snapshots_length)
                         renewable_patterns[pattern_name] = pattern
-                        _norm_note = "원본값(정규화 생략)" if _is_re_pattern else "최댓값 정규화"
-                        print(f"  [{pattern_name}] 로드 완료 - 길이: {len(pattern)}, 최대: {np.max(pattern):.3f}, 합계: {np.sum(pattern):.3f} ({_norm_note})")
+                        print(f"  [{pattern_name}] 로드 완료 - 길이: {len(pattern)}, 최대: {np.max(pattern):.3f}, 최소: {np.min(pattern):.3f}")
             
             if not renewable_patterns:
                 print("[경고] 재생에너지 패턴을 찾을 수 없습니다. 기본값 1.0을 사용합니다.")
@@ -1537,8 +1529,10 @@ def create_network(input_data):
                             if not (7 <= hour < 18):
                                 pattern[idx] = 0.0
                     
-                    # 패턴을 p_max_pu에 적용
-                    network.generators_t.p_max_pu[gen_name] = pattern
+                    # 패턴을 p_max_pu에 적용 (PV 출력 스케일 0.84 적용)
+                    # → 설치용량(p_nom)은 그대로, 최대 출력을 84%로 제한
+                    PV_OUTPUT_SCALE = 0.84
+                    network.generators_t.p_max_pu[gen_name] = pattern * PV_OUTPUT_SCALE
                     pv_applied_count += 1
                     pattern_applied = True
             
@@ -1562,8 +1556,10 @@ def create_network(input_data):
                         print(f"[경고] {pattern_key} 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
                         pattern = adjust_pattern_length(pattern, len(network.snapshots))
                     
-                    # 패턴을 p_max_pu에 직접 적용
-                    network.generators_t.p_max_pu[gen_name] = pattern
+                    # 패턴을 p_max_pu에 적용 (WT 출력 스케일 0.91 적용)
+                    # → 설치용량(p_nom)은 그대로, 최대 출력을 91%로 제한
+                    WT_OUTPUT_SCALE = 0.91
+                    network.generators_t.p_max_pu[gen_name] = pattern * WT_OUTPUT_SCALE
                     wt_applied_count += 1
                     pattern_applied = True
             
