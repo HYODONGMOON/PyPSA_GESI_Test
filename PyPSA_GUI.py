@@ -1288,8 +1288,8 @@ def create_network(input_data):
             'AC': {'name': 'AC', 'co2_emissions': 0},
             'DC': {'name': 'DC', 'co2_emissions': 0},
             'electricity': {'name': 'electricity', 'co2_emissions': 0},
-            'coal': {'name': 'coal', 'co2_emissions': 0.8384 * 0.43},  # 석탄: 0.8384 tCO2/MWh_e × 평균효율0.43
-            'gas': {'name': 'gas', 'co2_emissions': 0.38 * 0.55},      # LNG:  0.38   tCO2/MWh_e × 모델효율0.55
+            'coal': {'name': 'coal', 'co2_emissions': 0.7789 * 0.43},  # 석탄: 0.8384 tCO2/MWh_e × 평균효율0.43
+            'gas': {'name': 'gas', 'co2_emissions': 0.3602 * 0.559},      # LNG:  0.38   tCO2/MWh_e × 모델효율0.55
             'nuclear': {'name': 'nuclear', 'co2_emissions': 0},
             'solar': {'name': 'solar', 'co2_emissions': 0},
             'wind': {'name': 'wind', 'co2_emissions': 0},
@@ -2706,14 +2706,17 @@ def optimize_network(network):
         DR_ANNUAL_HOURS    = 300  # 연간 최대 발동시간 (시간)
         # =====================================================================
 
-        # DR 발전기 p_max_pu 설정: 각 지역 전력수요 상위 5% 시점에만 1, 나머지 0
+        # DR 발전기 p_max_pu 설정: 잔여부하(전력수요 - RE발전가능량) 상위 시점에만 발동
+        # 잔여부하 = 지역 전력수요(t) - Σ[지역 RE발전기 p_nom × p_max_pu(t)]
+        # → 수요가 많아도 RE로 충분히 공급 가능한 시간은 DR 불필요 → 제외
+        # → 수요 피크 + RE 부족이 동시에 발생하는 시간에만 DR 발동
         try:
             dr_generators = [
                 g for g in network.generators.index
                 if str(network.generators.at[g, 'carrier']).upper() == 'DR'
             ]
             if dr_generators:
-                print(f"\n=== DR 발전기 p_max_pu 설정 (상위 {100 - DR_PEAK_PERCENTILE}% 피크 조건) ===")
+                print(f"\n=== DR 발전기 p_max_pu 설정 (잔여부하 상위 {100 - DR_PEAK_PERCENTILE}% 조건) ===")
                 region_codes = [
                     'SEL', 'BSN', 'DGU', 'ICN', 'GWJ', 'DJN', 'USN', 'SJG',
                     'GGD', 'GWD', 'CBD', 'CND', 'JBD', 'JND', 'GBD', 'GND', 'JJD'
@@ -2739,8 +2742,9 @@ def optimize_network(network):
                         network.generators_t.p_max_pu[dr_name] = pd.Series(1.0, index=network.snapshots)
                         continue
 
-                    # 해당 지역 전력버스 부하 시계열 합산
                     el_bus = f"{region}_EL"
+
+                    # ── ① 지역 전력버스 부하 시계열 합산 ────────────────────────
                     regional_load = pd.Series(0.0, index=network.snapshots)
                     try:
                         if (not network.loads.empty
@@ -2765,14 +2769,42 @@ def optimize_network(network):
                         network.generators_t.p_max_pu[dr_name] = pd.Series(1.0, index=network.snapshots)
                         continue
 
-                    # 상위 5% 임계값 계산 후 p_max_pu 설정
-                    threshold = float(np.percentile(regional_load.values, DR_PEAK_PERCENTILE))
-                    peak_mask = (regional_load >= threshold).astype(float)
+                    # ── ② 지역 RE 발전 가능량 시계열 합산 ──────────────────────
+                    # 같은 지역 EL 버스에 연결된 PV·WT 발전기의 p_nom × p_max_pu(t)
+                    re_potential = pd.Series(0.0, index=network.snapshots)
+                    re_carriers  = {'solar', 'wind'}
+                    try:
+                        for g in network.generators.index:
+                            g_carrier = str(network.generators.at[g, 'carrier']).lower()
+                            g_bus     = str(network.generators.at[g, 'bus'])
+                            if g_carrier not in re_carriers:
+                                continue
+                            if not (g_bus.startswith(region + '_') or g_bus == region):
+                                continue
+                            g_pnom = float(network.generators.at[g, 'p_nom'])
+                            if g in network.generators_t.p_max_pu.columns:
+                                cf_series = network.generators_t.p_max_pu[g].reindex(
+                                    network.snapshots).fillna(0.0)
+                            else:
+                                cf_val = float(network.generators.at[g, 'p_max_pu']
+                                               if 'p_max_pu' in network.generators.columns else 1.0)
+                                cf_series = pd.Series(cf_val, index=network.snapshots)
+                            re_potential = re_potential.add(g_pnom * cf_series, fill_value=0.0)
+                    except Exception as _e_re:
+                        print(f"  [경고] {dr_name}: RE 발전가능량 계산 실패 ({_e_re}) → 수요만 사용")
+
+                    # ── ③ 잔여부하 = 수요 - RE 발전가능량 (음수는 0으로 클리핑) ─
+                    residual_load = (regional_load - re_potential).clip(lower=0.0)
+
+                    # ── ④ 잔여부하 상위 X% 시점에 DR 발동 허용 ────────────────
+                    threshold = float(np.percentile(residual_load.values, DR_PEAK_PERCENTILE))
+                    peak_mask = (residual_load >= threshold).astype(float)
                     peak_hours = int(peak_mask.sum())
                     network.generators_t.p_max_pu[dr_name] = peak_mask
                     p_nom_dr = float(network.generators.at[dr_name, 'p_nom'])
-                    print(f"  DR {dr_name}: 임계값={threshold:.1f} MW, "
-                          f"발동가능={peak_hours}h/년, 용량={p_nom_dr:.0f} MW")
+                    print(f"  DR {dr_name}: 잔여부하 임계값={threshold:.1f} MW, "
+                          f"발동가능={peak_hours}h/년, 용량={p_nom_dr:.0f} MW "
+                          f"(수요피크={regional_load.max():.0f}MW, RE최대={re_potential.max():.0f}MW)")
             else:
                 print("\n[DR] DR 발전기 없음 - DR 설정 건너뜀")
         except Exception as _e_dr_setup:
