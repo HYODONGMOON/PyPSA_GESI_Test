@@ -1288,8 +1288,8 @@ def create_network(input_data):
             'AC': {'name': 'AC', 'co2_emissions': 0},
             'DC': {'name': 'DC', 'co2_emissions': 0},
             'electricity': {'name': 'electricity', 'co2_emissions': 0},
-            'coal': {'name': 'coal', 'co2_emissions': 0.7789 * 0.43},  # 석탄: 0.8384 tCO2/MWh_e × 평균효율0.43
-            'gas': {'name': 'gas', 'co2_emissions': 0.3602 * 0.559},      # LNG:  0.38   tCO2/MWh_e × 모델효율0.55
+            'coal': {'name': 'coal', 'co2_emissions': 0.8344 * 0.43},  # 석탄: 0.8384 tCO2/MWh_e × 평균효율0.43
+            'gas': {'name': 'gas', 'co2_emissions': 0.3781 * 0.559},      # LNG:  0.38   tCO2/MWh_e × 모델효율0.55
             'nuclear': {'name': 'nuclear', 'co2_emissions': 0},
             'solar': {'name': 'solar', 'co2_emissions': 0},
             'wind': {'name': 'wind', 'co2_emissions': 0},
@@ -1469,6 +1469,43 @@ def create_network(input_data):
 
         # 발전기 추가 후 재생에너지 패턴 적용
         print("\n=== 재생에너지 패턴 적용 시작 ===")
+        # ── interface.xlsx '입력시트' B28(PV), C28(WT) 에서 출력 스케일 로딩 ──────
+        # 셀이 비어 있거나 읽기 실패 시 기존 하드코딩 값(0.84, 0.91)을 유지
+        PV_OUTPUT_SCALE = 0.84   # 기본값
+        WT_OUTPUT_SCALE = 0.91   # 기본값
+        try:
+            import openpyxl as _opxl_re
+            _re_iface = os.path.abspath(os.path.join(get_base_dir(), 'interface.xlsx'))
+            if os.path.exists(_re_iface):
+                _wb_re = _opxl_re.load_workbook(_re_iface, data_only=True)
+                if '입력시트' in _wb_re.sheetnames:
+                    _ws_re = _wb_re['입력시트']
+                    _pv_val = _ws_re['B28'].value
+                    _wt_val = _ws_re['C28'].value
+                    if _pv_val is not None:
+                        _pv_f = float(_pv_val)
+                        if 0.0 < _pv_f <= 1.0:
+                            PV_OUTPUT_SCALE = _pv_f
+                            print(f"[RE 스케일] PV 출력 스케일: {PV_OUTPUT_SCALE:.4f} (interface.xlsx 입력시트 B28)")
+                        else:
+                            print(f"[RE 스케일] PV B28 값({_pv_f}) 범위 오류 → 기본값 {PV_OUTPUT_SCALE} 사용")
+                    else:
+                        print(f"[RE 스케일] PV B28 비어 있음 → 기본값 {PV_OUTPUT_SCALE} 사용")
+                    if _wt_val is not None:
+                        _wt_f = float(_wt_val)
+                        if 0.0 < _wt_f <= 1.0:
+                            WT_OUTPUT_SCALE = _wt_f
+                            print(f"[RE 스케일] WT 출력 스케일: {WT_OUTPUT_SCALE:.4f} (interface.xlsx 입력시트 C28)")
+                        else:
+                            print(f"[RE 스케일] WT C28 값({_wt_f}) 범위 오류 → 기본값 {WT_OUTPUT_SCALE} 사용")
+                    else:
+                        print(f"[RE 스케일] WT C28 비어 있음 → 기본값 {WT_OUTPUT_SCALE} 사용")
+                else:
+                    print(f"[RE 스케일] '입력시트' 시트 없음 → 기본값 PV={PV_OUTPUT_SCALE}, WT={WT_OUTPUT_SCALE} 사용")
+        except Exception as _e_re_scale:
+            print(f"[RE 스케일] interface.xlsx 읽기 실패: {_e_re_scale} → 기본값 사용")
+        # ─────────────────────────────────────────────────────────────────────
+
         pv_applied_count = 0
         wt_applied_count = 0
         
@@ -1529,9 +1566,8 @@ def create_network(input_data):
                             if not (7 <= hour < 18):
                                 pattern[idx] = 0.0
                     
-                    # 패턴을 p_max_pu에 적용 (PV 출력 스케일 0.84 적용)
-                    # → 설치용량(p_nom)은 그대로, 최대 출력을 84%로 제한
-                    PV_OUTPUT_SCALE = 0.84
+                    # 패턴을 p_max_pu에 적용 (PV 출력 스케일: interface.xlsx 입력시트 B28, 기본 0.84)
+                    # → 설치용량(p_nom)은 그대로, 최대 출력을 스케일만큼 제한
                     network.generators_t.p_max_pu[gen_name] = pattern * PV_OUTPUT_SCALE
                     pv_applied_count += 1
                     pattern_applied = True
@@ -1556,9 +1592,8 @@ def create_network(input_data):
                         print(f"[경고] {pattern_key} 길이 불일치: {len(pattern)} vs {len(network.snapshots)}")
                         pattern = adjust_pattern_length(pattern, len(network.snapshots))
                     
-                    # 패턴을 p_max_pu에 적용 (WT 출력 스케일 0.91 적용)
-                    # → 설치용량(p_nom)은 그대로, 최대 출력을 91%로 제한
-                    WT_OUTPUT_SCALE = 0.91
+                    # 패턴을 p_max_pu에 적용 (WT 출력 스케일: interface.xlsx 입력시트 C28, 기본 0.91)
+                    # → 설치용량(p_nom)은 그대로, 최대 출력을 스케일만큼 제한
                     network.generators_t.p_max_pu[gen_name] = pattern * WT_OUTPUT_SCALE
                     wt_applied_count += 1
                     pattern_applied = True
@@ -2703,7 +2738,7 @@ def optimize_network(network):
         # DR(수요반응) 설정 - 하드코딩 파라미터
         # =====================================================================
         DR_PEAK_PERCENTILE = 90   # 상위 10% 부하 시점에서만 발동 허용
-        DR_ANNUAL_HOURS    = 300  # 연간 최대 발동시간 (시간)
+        DR_ANNUAL_HOURS    = 60  # 연간 최대 발동시간 (시간)
         # =====================================================================
 
         # DR 발전기 p_max_pu 설정: 잔여부하(전력수요 - RE발전가능량) 상위 시점에만 발동
