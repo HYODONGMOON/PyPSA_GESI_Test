@@ -181,6 +181,9 @@ INPUT_FILE = "integrated_input_data.xlsx"
 # run_longterm_scenario.py 에서 자동으로 True 로 설정됨
 SKIP_VISUALIZATION = False
 
+# images / seasonal_analysis / regional_analysis 폴더 차트 생성 여부 (False: 비활성화)
+ENABLE_EXTRA_CHARTS = False
+
 def _normalize_region_code(value):
     try:
         s = str(value).strip()
@@ -1100,6 +1103,36 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
     except Exception:
         return None
 
+def _apply_existing_capacity_as_min(network):
+    """
+    확장 가능한 설비의 기존 용량(p_nom/e_nom/s_nom)을 확장 하한(*_nom_min)으로 적용한다.
+    별도 하한이 입력되어 있으면 둘 중 큰 값을 사용하고, 상한이 기존 용량보다 작으면 상한을 기존 용량으로 올린다.
+    """
+    print("\n=== 기존 용량을 확장 하한으로 적용 ===")
+    specs = [('generators', 'p_nom'), ('links', 'p_nom'), ('stores', 'e_nom'), ('lines', 's_nom')]
+    for comp, attr in specs:
+        df = getattr(network, comp)
+        ext_col, min_col, max_col = f'{attr}_extendable', f'{attr}_min', f'{attr}_max'
+        if df.empty or ext_col not in df.columns:
+            continue
+        ext = df[ext_col].astype(bool)
+        existing = pd.to_numeric(df[attr], errors='coerce').fillna(0.0)
+        target = ext & (existing > 0)
+        if not target.any():
+            continue
+        cur_min = pd.to_numeric(df[min_col], errors='coerce').fillna(0.0)
+        new_min = np.maximum(cur_min[target], existing[target])
+        raised = (new_min > cur_min[target] + 1e-6).sum()
+        df.loc[target, min_col] = new_min
+
+        cur_max = pd.to_numeric(df[max_col], errors='coerce').fillna(np.inf)
+        low_max = target & (cur_max < existing - 1e-6)
+        for name in df.index[low_max]:
+            print(f"  [상한조정] {name}: {max_col}({cur_max[name]:,.0f}) < 기존 {attr}({existing[name]:,.0f}) → 상한을 기존 용량으로 상향")
+        df.loc[low_max, max_col] = existing[low_max]
+        print(f"  {comp}: 확장 가능 설비 {int(target.sum())}개에 기존 용량 하한 적용 (하한 상향 {int(raised)}개)")
+
+
 def _sanitize_component_bounds(network):
     """
     네트워크 컴포넌트의 경계값 이상을 탐지하고 수정한다.
@@ -1416,12 +1449,17 @@ def create_network(input_data):
                     """발전기 이름에서 올바른 carrier 추론"""
                     gen_lower = gen_name.lower()
                     
+                    # 슬랙/폴백은 가상 공급원이므로 배출 carrier를 부여하면 CO2 한도를 잠식함
+                    if 'slack' in gen_lower or 'fallback' in gen_lower:
+                        orig = str(original_carrier).strip()
+                        return orig if orig and orig.lower() not in ('nan', 'coal', 'gas') else 'electricity'
+                    
                     # 석탄발전소 이름으로 인식 (발전소 이름 포함)
                     coal_plants = ['coal', '석탄', '당진', '영흥', '하동', '삼척', '태안', '보령', '삼천포', '호남', '동해']
                     if any(keyword in gen_lower for keyword in coal_plants):
                         return 'coal'
-                    elif any(keyword in gen_lower for keyword in ['lng', 'gas', 'chp', '가스', 'slack', 'fallback']):
-                        return 'gas'  # 슬랙/폴백 발전기도 LNG 기반으로 처리
+                    elif any(keyword in gen_lower for keyword in ['lng', 'gas', 'chp', '가스']):
+                        return 'gas'
                     elif any(keyword in gen_lower for keyword in ['nuclear', '원자력']):
                         return 'nuclear'
                     elif any(keyword in gen_lower for keyword in ['pv', 'solar', '태양']):
@@ -1493,7 +1531,7 @@ def create_network(input_data):
                         print(f"[RE 스케일] PV B28 비어 있음 → 기본값 {PV_OUTPUT_SCALE} 사용")
                     if _wt_val is not None:
                         _wt_f = float(_wt_val)
-                        if 0.0 < _wt_f <= 1.0:
+                        if 0.0 < _wt_f <= 1.1:
                             WT_OUTPUT_SCALE = _wt_f
                             print(f"[RE 스케일] WT 출력 스케일: {WT_OUTPUT_SCALE:.4f} (interface.xlsx 입력시트 C28)")
                         else:
@@ -1744,18 +1782,18 @@ def create_network(input_data):
                         continue
                     fallback_name = f"{bus}_Fallback_Gen"
                     if fallback_name not in network.generators.index:
-                        # 열 fallback: 가스보일러 운영비 수준 (~10만 원/MWh_열)
-                        # HP 대비 약 50% 비싸지만 필요시 사용 가능한 수준
+                        # 열 fallback: 전력 slack과 동일한 페널티 (5,000 천원/MWh)
+                        # 배출 0인 가상 열원이므로 실제 열원보다 싸게 두면 안 됨
                         network.add("Generator",
                                    name=fallback_name,
                                    bus=bus,
                                    p_nom=0.0,
                                    p_nom_extendable=True,
                                    capital_cost=0.0,
-                                   marginal_cost=1e5,
+                                   marginal_cost=5000,
                                    carrier='heat')
                         network.generators_t.p_max_pu[fallback_name] = pd.Series(1.0, index=network.snapshots)
-                        print(f"열 보강 발전기 추가(가스보일러 수준): {fallback_name} (버스 {bus}, 10만 원/MWh)")
+                        print(f"열 보강 발전기 추가(페널티): {fallback_name} (버스 {bus}, 5,000 천원/MWh)")
                     continue
                 # 전력 버스: LNG_Fallback_Gen / Slack_Gen 비활성화
                 # - 전력 시스템은 석탄/LNG/원자력/RE 등 충분한 발전원이 있으므로 보완 발전기 불필요
@@ -1919,7 +1957,7 @@ def create_network(input_data):
                                    p_nom=0.0,
                                    p_nom_extendable=True,
                                    capital_cost=1000,
-                                   marginal_cost=40,
+                                   marginal_cost=5000,
                                    carrier='heat')
                         network.generators_t.p_max_pu[fallback_name] = pd.Series(1.0, index=network.snapshots)
                         added_backup += 1
@@ -2130,6 +2168,14 @@ def create_network(input_data):
                         params['p_nom_min'] = float(link.get('p_nom_min'))
                     if 'p_nom_max' in links_df.columns and pd.notna(link.get('p_nom_max')):
                         params['p_nom_max'] = float(link.get('p_nom_max'))
+                    
+                    # capital_cost: 발전기/저장장치와 동일하게 입력값을 그대로 적용
+                    cap_raw = _read_first_available(['capital_cost', '자본비용', '설비비용'])
+                    if cap_raw is not None:
+                        try:
+                            params['capital_cost'] = float(cap_raw)
+                        except (TypeError, ValueError):
+                            print(f"경고: Link {link_name}의 capital_cost '{cap_raw}'를 숫자로 변환하지 못해 무시합니다.")
                     
                     try:
                         network.add("Link", **params)
@@ -2685,6 +2731,11 @@ def create_network(input_data):
         except Exception as _e_fs:
             print(f"최후수단 슬랙 발전기 추가 경고: {_e_fs}")
         
+        try:
+            _apply_existing_capacity_as_min(network)
+        except Exception as _e_m:
+            print(f"기존 용량 하한 적용 경고: {_e_m}")
+
         # 경계값(최소/최대) 정리: infeasible 방지
         try:
             _sanitize_component_bounds(network)
@@ -3312,13 +3363,18 @@ def optimize_network(network):
             #   → Crossover 수천 초 소요 문제 근본 해결
             # - parallel=1: 결정론적 병렬
             # - barrier.algorithm=3: Mehrotra predictor-corrector
+            # - barrier.convergetol=1e-6: 기본값 1e-8에서는 목적함수 갭이 ~1e-8까지 줄어도
+            #   primal infeasibility 정체로 'unknown' 종료되는 경우가 있음
+            #   (수렴 실패 시 환경변수 PYPSA_CPLEX_CONVERGETOL 로 완화 가능)
+            _cplex_convergetol = float(os.environ.get('PYPSA_CPLEX_CONVERGETOL', 1e-6))
             option_variants = [
                 {'name': 'barrier_primal_only',
                  'opts': {'threads': num_cores, 'lpmethod': 4,
                           'parallel': 1, 'barrier.algorithm': 3,
+                          'barrier.convergetol': _cplex_convergetol,
                           'solutiontype': 2}},
             ]
-            print(f"[최적화 설정] CPLEX Barrier + solutiontype=2 (Crossover 생략), 스레드: {num_cores}개")
+            print(f"[최적화 설정] CPLEX Barrier + solutiontype=2 (Crossover 생략), convergetol={_cplex_convergetol:g}, 스레드: {num_cores}개")
         else:
             # HiGHS: IPM(내부점법)으로 대규모 LP 처리
             option_variants = [
@@ -3487,6 +3543,8 @@ def optimize_network(network):
                                     print(f"    assign_solution 완료 → 결과 정상 반영")
                                 except Exception:
                                     print(f"    assign_solution 실패({_e_as}), 결과 일부 누락 가능")
+                            if getattr(network, 'objective', None) is None:
+                                network.objective = float(valid_obj)
                             last_status = ('ok', 'optimal')
                             break
                         else:
@@ -4665,59 +4723,44 @@ def save_results(network, filename=None, subdir=None):
             except Exception as _e_rpb:
                 print(f"지역별 전력수급 균형 시트 저장 경고: {_e_rpb}")
 
-            # 국가 기준 시간별 수급표(전력/열/수소)
-            try:
-                ts_el, ts_h, ts_h2 = _build_country_timeseries_tables(network)
-                ts_el.to_excel(writer, sheet_name='TS_Electricity_National')
-                ts_h.to_excel(writer, sheet_name='TS_Heat_National')
-                ts_h2.to_excel(writer, sheet_name='TS_Hydrogen_National')
-                
-                # 8) Curtailment 상세 정보 저장
-                if 're_curtailment' in results and results['re_curtailment']:
-                    try:
-                        # Curtailment 요약
-                        curtailment_summary = []
-                        for gen, data in results['re_curtailment'].items():
-                            curtailment_summary.append({
-                                '발전기': gen,
-                                '지역': gen.split('_')[0] if '_' in gen else gen,
-                                '기술': 'PV' if 'PV' in gen.upper() else ('WT' if 'WT' in gen.upper() or 'WIND' in gen.upper() else '기타'),
-                                '잠재_발전량_MWh': data['potential_MWh'],
-                                '실제_발전량_MWh': data['actual_MWh'],
-                                'Curtailment_MWh': data['total_MWh'],
-                                'Curtailment_비율_%': data['curtailment_rate_%']
-                            })
-                        curtailment_summary_df = pd.DataFrame(curtailment_summary)
-                        curtailment_summary_df = curtailment_summary_df.sort_values('Curtailment_MWh', ascending=False)
-                        curtailment_summary_df.to_excel(writer, sheet_name='RE_Curtailment_Summary', index=False)
-                        
-                        # Curtailment 시계열 (상위 10개 발전기)
-                        top_generators = curtailment_summary_df.head(10)['발전기'].tolist()
-                        curtailment_timeseries = pd.DataFrame(index=network.snapshots)
-                        for gen in top_generators:
-                            if gen in results['re_curtailment']:
-                                curtailment_timeseries[gen] = results['re_curtailment'][gen]['timeseries']
-                        if not curtailment_timeseries.empty:
-                            curtailment_timeseries.to_excel(writer, sheet_name='RE_Curtailment_Timeseries')
-                        
-                        print(f"Curtailment 데이터 저장 완료: {len(curtailment_summary)}개 발전기")
-                    except Exception as e_curt:
-                        print(f"Curtailment 저장 경고: {e_curt}")
-            except Exception as _e_ts:
-                print(f"국가 시간별 수급표 저장 경고: {_e_ts}")
+            # 다음 연도 승계 입력표 (확장 설비 최적 용량 → interface 입력 셀)
+            if has_objective:
                 try:
-                    # 폴백: 부하만이라도 기록
-                    if hasattr(network.loads_t, 'p_set') and (network.loads_t.p_set is not None) and (not network.loads_t.p_set.empty):
-                        network.loads_t.p_set.to_excel(writer, sheet_name='TS_Loads_Fallback')
-                except Exception:
-                    pass
+                    from carryover_sheet import write_carryover_sheet
+                    write_carryover_sheet(writer, network, os.path.join(get_base_dir(), 'interface.xlsx'))
+                except Exception as _e_co:
+                    print(f"다음연도 승계 입력 시트 저장 경고: {_e_co}")
 
-            # 분석 윈도우 시트 (선로 포화 구간 168h)
-            try:
-                print("\nAnalysis_Window 시트 생성 중...")
-                _build_analysis_window_sheet(network, results, writer)
-            except Exception as _e_aw:
-                print(f"Analysis_Window 시트 생성 경고: {_e_aw}")
+            # 8) Curtailment 상세 정보 저장
+            if 're_curtailment' in results and results['re_curtailment']:
+                try:
+                    # Curtailment 요약
+                    curtailment_summary = []
+                    for gen, data in results['re_curtailment'].items():
+                        curtailment_summary.append({
+                            '발전기': gen,
+                            '지역': gen.split('_')[0] if '_' in gen else gen,
+                            '기술': 'PV' if 'PV' in gen.upper() else ('WT' if 'WT' in gen.upper() or 'WIND' in gen.upper() else '기타'),
+                            '잠재_발전량_MWh': data['potential_MWh'],
+                            '실제_발전량_MWh': data['actual_MWh'],
+                            'Curtailment_MWh': data['total_MWh'],
+                            'Curtailment_비율_%': data['curtailment_rate_%']
+                        })
+                    curtailment_summary_df = pd.DataFrame(curtailment_summary)
+                    curtailment_summary_df = curtailment_summary_df.sort_values('Curtailment_MWh', ascending=False)
+                    curtailment_summary_df.to_excel(writer, sheet_name='RE_Curtailment_Summary', index=False)
+                    
+                    # Curtailment 시계열 (Summary와 동일한 전체 발전기, 동일 순서)
+                    curtailment_timeseries = pd.DataFrame(
+                        {gen: results['re_curtailment'][gen]['timeseries']
+                         for gen in curtailment_summary_df['발전기']},
+                        index=network.snapshots)
+                    if not curtailment_timeseries.empty:
+                        curtailment_timeseries.to_excel(writer, sheet_name='RE_Curtailment_Timeseries')
+                    
+                    print(f"Curtailment 데이터 저장 완료: {len(curtailment_summary)}개 발전기 (요약/시계열)")
+                except Exception as e_curt:
+                    print(f"Curtailment 저장 경고: {e_curt}")
 
         # 2. 개별 CSV 파일들 저장
         try:
@@ -4838,23 +4881,26 @@ def save_results(network, filename=None, subdir=None):
             # 6. 시각화 결과 생성
             create_visualizations(network, results_dir, current_time)
 
-            # 6.5. 커스텀 시각화 5종 (results_dir/images/ 폴더)
-            try:
-                create_custom_visualizations(network, results_dir)
-            except Exception as _e_cv:
-                print(f"커스텀 시각화 생성 경고: {_e_cv}")
+            if not ENABLE_EXTRA_CHARTS:
+                print("[추가 차트 생략] ENABLE_EXTRA_CHARTS=False — images/seasonal_analysis/regional_analysis 생성 안 함")
+            else:
+                # 6.5. 커스텀 시각화 5종 (results_dir/images/ 폴더)
+                try:
+                    create_custom_visualizations(network, results_dir)
+                except Exception as _e_cv:
+                    print(f"커스텀 시각화 생성 경고: {_e_cv}")
 
-            # 7. 계절별 대표 구간 시각화 (5종 × 4계절, 전국)
-            try:
-                create_seasonal_analysis_charts(network, results, results_dir, current_time)
-            except Exception as _e_sea:
-                print(f"계절별 시각화 생성 경고: {_e_sea}")
+                # 7. 계절별 대표 구간 시각화 (5종 × 4계절, 전국)
+                try:
+                    create_seasonal_analysis_charts(network, results, results_dir, current_time)
+                except Exception as _e_sea:
+                    print(f"계절별 시각화 생성 경고: {_e_sea}")
 
-            # 8. 지역별 × 계절별 시각화 (5종 × 4계절 × 각 지역)
-            try:
-                create_regional_analysis_charts(network, results, results_dir, current_time)
-            except Exception as _e_reg:
-                print(f"지역별 시각화 생성 경고: {_e_reg}")
+                # 8. 지역별 × 계절별 시각화 (5종 × 4계절 × 각 지역)
+                try:
+                    create_regional_analysis_charts(network, results, results_dir, current_time)
+                except Exception as _e_reg:
+                    print(f"지역별 시각화 생성 경고: {_e_reg}")
 
         print(f"결과가 '{results_dir}' 폴더에 저장되었습니다.")
         print(f"- Excel 파일: {excel_filename}")
@@ -4862,7 +4908,8 @@ def save_results(network, filename=None, subdir=None):
         print(f"- 통계 파일: stats.json")
         print(f"- 네트워크 파일: .nc")
         print(f"- 시각화 파일들: PNG, HTML")
-        print(f"- 커스텀 차트 5종: {results_dir}/images/")
+        if ENABLE_EXTRA_CHARTS:
+            print(f"- 커스텀 차트 5종: {results_dir}/images/")
 
         return True
 
