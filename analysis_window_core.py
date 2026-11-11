@@ -117,6 +117,109 @@ def _read_sheets(path, wanted, progress=None):
     return out
 
 
+COAL_PLANT_KEYWORDS = ['당진', '영흥', '하동', '삼척', '태안', '보령', '삼천포', '호남', '동해',
+                       '강릉안인', '북평', '신서천', '고성', '여수', '삼척그린파워']
+
+
+def _open_network(path, progress=None):
+    """netCDF 는 비ASCII 경로를 열지 못하므로 필요하면 임시 폴더로 복사해서 연다."""
+    import shutil
+    import tempfile
+    import pypsa
+    if progress:
+        progress('PyPSA 네트워크(.nc) 여는 중')
+    src = path
+    tmp = None
+    if not path.isascii():
+        tmp = os.path.join(tempfile.gettempdir(), f'aw_nc_{abs(hash(path))}.nc')
+        shutil.copyfile(path, tmp)
+        src = tmp
+    try:
+        return pypsa.Network(src)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _raw_from_network(path, progress=None):
+    """PyPSA .nc → save_results 가 만드는 시트와 같은 구조의 raw dict."""
+    n = _open_network(path, progress)
+    if progress:
+        progress('네트워크에서 시간별 데이터 구성 중')
+
+    def clean(df):
+        df = df.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.fillna(0.0)
+
+    def info(df, cols):
+        df = df[[c for c in cols if c in df.columns]].copy()
+        df.index = [str(i).strip() for i in df.index]
+        return df
+
+    raw = {}
+    gtp = n.generators_t.p
+    if gtp is None or gtp.empty:
+        return {'_sheetnames': []}
+    coal = [c for c in gtp.columns
+            if 'coal' in str(n.generators.at[c, 'carrier']).lower() or any(k in c for k in COAL_PLANT_KEYWORDS)]
+    agg = gtp.drop(columns=coal)
+    for col in coal:
+        k = f"{col.split('_')[0] if '_' in col else 'ETC'}_Coal"
+        agg[k] = agg[k] + gtp[col] if k in agg else gtp[col]
+    raw['National_Gen_Output'] = _national(clean(agg))
+    raw['Generator_Info'] = info(n.generators, ['bus', 'p_nom', 'p_nom_opt'])
+
+    if not n.lines_t.p0.empty:
+        raw['Line_Flow'] = clean(n.lines_t.p0)
+        raw['Line_Info'] = info(n.lines, ['bus0', 'bus1', 's_nom', 's_nom_opt'])
+    if not n.links_t.p0.empty:
+        raw['Link_Flow'] = clean(n.links_t.p0)
+        raw['National_Link_Flow'] = _national(raw['Link_Flow'])
+        raw['Link_Info'] = info(n.links, ['bus0', 'bus1', 'p_nom', 'efficiency', 'p_nom_opt'])
+    if not n.stores_t.p.empty:
+        raw['Storage_Power'] = clean(n.stores_t.p)
+        raw['National_Storage_Power'] = _national(raw['Storage_Power'])
+        raw['Storage_Info'] = info(n.stores, ['bus', 'carrier', 'e_nom', 'e_nom_opt'])
+    if not n.stores_t.e.empty:
+        raw['National_Storage_Energy'] = _national(clean(n.stores_t.e))
+
+    curt = {}
+    pmax = n.generators_t.p_max_pu
+    for g in n.generators.index:
+        if not any(k in g.lower() for k in ['pv', 'solar', 'wind', 'wt']):
+            continue
+        if g not in pmax.columns or g not in gtp.columns:
+            continue
+        opt = n.generators.at[g, 'p_nom_opt'] if 'p_nom_opt' in n.generators else float('nan')
+        ext = bool(n.generators.at[g, 'p_nom_extendable'])
+        p_nom = float(opt) if ext and pd.notna(opt) and float(opt) > 0 else float(n.generators.at[g, 'p_nom'])
+        c = (pmax[g] * p_nom - gtp[g]).clip(lower=0)
+        if c.sum() > 0.1:
+            curt[g.strip()] = c
+    if curt:
+        raw['RE_Curtailment_Timeseries'] = pd.DataFrame(curt, index=gtp.index)
+
+    ltp = n.loads_t.p if not n.loads_t.p.empty else n.loads_t.p_set
+    if ltp is not None and not ltp.empty:
+        hl = clean(ltp)
+        raw['Hourly_Loads'] = hl
+        cols = list(hl.columns)
+        groups = {
+            '전력수요_MW': [c for c in cols if '_Demand_EL' in c or (c.endswith('_EL') and '_Demand_' not in c)],
+            '열수요_MW': [c for c in cols if '_Demand_H' in c and '_H2' not in c and '_EL' not in c and '_EV' not in c],
+            'EV수요_MW': [c for c in cols if '_Demand_EV' in c or (c.endswith('_EV') and '_Demand_' not in c)],
+            'Fab수요_MW': [c for c in cols if '_Demand_Fab' in c],
+            'DC수요_MW': [c for c in cols if '_Demand_DC' in c],
+        }
+        raw['National_Loads'] = pd.DataFrame({k: hl[v].sum(axis=1) for k, v in groups.items() if v}, index=hl.index)
+    raw['_sheetnames'] = [k for k in raw]
+    return raw
+
+
 def _national(df):
     agg = {}
     for c in df.columns:
@@ -276,7 +379,10 @@ def load_result(path, use_cache=True, progress=None):
         except Exception:
             pass
 
-    raw = _read_sheets(path, RAW_SHEETS, progress)
+    if path.lower().endswith('.nc'):
+        raw = _raw_from_network(path, progress)
+    else:
+        raw = _read_sheets(path, RAW_SHEETS, progress)
     if 'National_Gen_Output' not in raw and 'Generator_Output' in raw['_sheetnames']:
         go = _read_sheets(path, ['Generator_Output'], progress).get('Generator_Output')
         if go is not None and go.shape[1] > 0:
@@ -305,7 +411,7 @@ def load_result(path, use_cache=True, progress=None):
 
 
 def list_result_files(folder, recursive=False):
-    pat = re.compile(r'\.(xlsx|xlsm)$', re.I)
+    pat = re.compile(r'\.(xlsx|xlsm|nc)$', re.I)
     out = []
     if recursive:
         for root, dirs, files in os.walk(folder):
