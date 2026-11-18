@@ -201,6 +201,492 @@ def _normalize_region_code(value):
     except Exception:
         return str(value)
 
+def _parse_pct_cell(cell):
+    """셀 값을 % 숫자로 해석: 30 / '30%' → 30, % 서식 셀의 0.3 → 30. 빈칸·해석 불가 → None"""
+    raw = cell.value
+    if raw is None or str(raw).strip() == '':
+        return None
+    text = str(raw).strip()
+    try:
+        if text.endswith('%'):
+            return float(text.rstrip('%').strip())
+        if '%' in str(cell.number_format or '') and isinstance(raw, (int, float)):
+            return float(raw) * 100.0
+        return float(text)
+    except ValueError:
+        return None
+
+def _read_ev_v1g_cells(ws, opts):
+    """입력시트 B40·C40(출발 시각·잔량), B44·C44(가용률 최대·평균). 비율 셀은 0.75 / 75 / '75%' 모두 75%"""
+    def _frac(addr, key):
+        v = _parse_pct_cell(ws[addr])
+        if v is None:
+            return
+        v = v / 100.0 if v > 1.0 else v
+        if 0.0 <= v <= 1.0:
+            opts[key] = v
+        else:
+            print(f"[EV 옵션] {addr}={ws[addr].value!r} 범위 밖 → 기본값 {opts[key]:.0%}")
+    b40 = ws['B40'].value
+    if b40 is not None and str(b40).strip() != '':
+        try:
+            h = int(float(str(b40).strip()))
+            if 0 <= h <= 23:
+                opts['dep_hour'] = h
+            else:
+                print(f"[EV 옵션] B40(출발 시각)={b40!r} 범위(0~23) 밖 → 기본값 {opts['dep_hour']}시")
+        except ValueError:
+            print(f"[EV 옵션] B40(출발 시각)={b40!r} 해석 불가 → 기본값 {opts['dep_hour']}시")
+    _frac('C40', 'dep_soc')
+    _frac('B44', 'avail_max')
+    _frac('C44', 'avail_mean')
+    if opts['avail_mean'] > opts['avail_max']:
+        print(f"[EV 옵션] 가용률 평균({opts['avail_mean']:.0%}) > 최대({opts['avail_max']:.0%}) → 평균=최대")
+        opts['avail_mean'] = opts['avail_max']
+    print(f"[EV 옵션] V1G: 출발 {opts['dep_hour']}시 잔량 ≥ {opts['dep_soc']:.0%} (B40·C40), "
+          f"플러그인 가용률 최대 {opts['avail_max']:.0%} / 평균 {opts['avail_mean']:.0%} (B44·C44)")
+
+def _read_ev_charging_options(interface_path):
+    """
+    interface.xlsx '입력시트' EV 충전 옵션
+      B38 = 'Y'        → load_patterns F6:F8765 패턴으로 충전 (일별 충전량 = 그날 EV 수요)
+      B38 = 'N'/빈칸   → 기존 방식(충전 시점 최적화)
+      C38 = 스마트충전 비중(%) — B38='Y'일 때만 사용. 30 / '30%' / % 서식 0.3 모두 30%. 빈칸이면 0%
+      B39 = 'Y'        → V2G 기존 방식 유지
+      B39 = 'N'/빈칸   → V2G 끔
+      V1G 차량군(B38='Y', C38>0일 때) — 빈칸이면 기본값
+      B40 = 출발 시각(0~23시, 기본 7)        C40 = 출발 시각 최소 배터리 잔량(기본 75%)
+      B44 = 플러그인 가용률 최대(기본 95%)    C44 = 플러그인 가용률 평균(기본 80%)
+    반환: {'fixed', 'v2g', 'smart_share', 'dep_hour', 'dep_soc', 'avail_max', 'avail_mean', 'pattern'}
+    """
+    opts = {'fixed': False, 'v2g': False, 'smart_share': 0.0, 'pattern': None,
+            'dep_hour': 7, 'dep_soc': 0.75, 'avail_max': 0.95, 'avail_mean': 0.8}
+    try:
+        import openpyxl as _opxl_ev
+        if not os.path.exists(interface_path):
+            print(f"[EV 옵션] interface.xlsx 없음 → 고정충전=N, V2G=N")
+            return opts
+        wb = _opxl_ev.load_workbook(interface_path, read_only=True, data_only=True)
+        try:
+            if '입력시트' in wb.sheetnames:
+                ws = wb['입력시트']
+                b38 = ws['B38'].value
+                b39 = ws['B39'].value
+                opts['fixed'] = str(b38).strip().upper() == 'Y' if b38 is not None else False
+                opts['v2g'] = str(b39).strip().upper() == 'Y' if b39 is not None else False
+                print(f"[EV 옵션] 입력시트 B38(고정 충전패턴)={b38!r} → {'Y' if opts['fixed'] else 'N'}, "
+                      f"B39(V2G)={b39!r} → {'Y' if opts['v2g'] else 'N'}")
+                if opts['fixed']:
+                    c38 = ws['C38']
+                    pct = _parse_pct_cell(c38)
+                    if pct is None:
+                        if c38.value is not None and str(c38.value).strip() != '':
+                            print(f"[EV 옵션] C38(스마트충전 비중)={c38.value!r} 해석 불가 → 0%")
+                        pct = 0.0
+                    elif not (0.0 <= pct <= 100.0):
+                        print(f"[EV 옵션] C38(스마트충전 비중)={c38.value!r} → {pct}% 범위(0~100) 밖 → 0%")
+                        pct = 0.0
+                    opts['smart_share'] = pct / 100.0
+                    print(f"[EV 옵션] C38(스마트충전 비중)={c38.value!r} → 스마트 {pct:.1f}% / 고정패턴 {100 - pct:.1f}%")
+                    if opts['smart_share'] > 0:
+                        _read_ev_v1g_cells(ws, opts)
+            else:
+                print("[EV 옵션] '입력시트' 시트 없음 → 고정충전=N, V2G=N")
+            if 'load_patterns' in wb.sheetnames:
+                vals = [r[0] for r in wb['load_patterns'].iter_rows(
+                    min_row=6, max_row=8765, min_col=6, max_col=6, values_only=True)]
+                arr = pd.to_numeric(pd.Series(vals), errors='coerce').fillna(0.0).astype(float).values
+                if len(arr) == 8760 and arr.max() > 0 and arr.min() >= 0:
+                    opts['pattern'] = arr
+                else:
+                    print(f"[EV 옵션] load_patterns F6:F8765 패턴 이상(길이 {len(arr)}, "
+                          f"최대 {arr.max() if len(arr) else 'n/a'})")
+            else:
+                print("[EV 옵션] 'load_patterns' 시트 없음")
+            if opts['fixed'] and opts['pattern'] is None:
+                print("[EV 옵션] 충전 패턴을 읽지 못해 고정 충전 미적용")
+                opts['fixed'] = False
+        finally:
+            wb.close()
+    except Exception as _e_ev:
+        print(f"[EV 옵션] 읽기 실패: {_e_ev} → 고정충전=N, V2G=N")
+        opts['fixed'] = False
+    return opts
+
+def _apply_ev_fixed_charging_bounds(network, pattern, smart_share=0.0, headroom=0.01):
+    """
+    EV 고정 충전(입력시트 B38='Y'): 충전 링크 출력을 시간별 상·하한으로 고정
+      충전량(t) = 그날 EV 주행수요 ÷ 충전효율 × [pattern(t) ÷ 그날 pattern 합]
+      p_min_pu = (1−s)×충전량(t)/p_nom,  p_max_pu = (1−s)×충전량(t)×(1+headroom)/p_nom
+      스마트 비중 s > 0 이면 s 몫은 _split_ev_v1g_fleet 가 별도 V1G 차량군으로 분리
+    headroom은 EV 저장 standing_loss 보전용 여유. 추가 제약식 없이 변수 범위만 정함.
+    """
+    fixed_share = 1.0 - float(smart_share)
+    sns = network.snapshots
+    w = network.snapshot_weightings['generators'].reindex(sns).fillna(1.0)
+    f = pd.Series(np.asarray(pattern, dtype=float), index=sns).clip(lower=0.0)
+    days = pd.DatetimeIndex(sns).normalize()
+    f_share = f / (f * w).groupby(days).transform('sum').replace(0.0, np.nan)
+    load = network.get_switchable_as_dense('Load', 'p_set')
+    L = network.links
+    chargers = [l for l in L.index if 'ev' in l.lower() and 'charg' in l.lower()]
+    done = 0
+    for l in chargers:
+        bus = L.at[l, 'bus1']
+        names = network.loads.index[network.loads.bus == bus]
+        p_nom = float(L.at[l, 'p_nom'] or 0.0)
+        if len(names) == 0 or p_nom <= 0:
+            print(f"  [EV 고정충전] {l}: EV 수요 또는 충전기 용량 없음 → 미적용")
+            continue
+        eff = float(L.at[l, 'efficiency'] or 1.0)
+        daily_mwh = (load[names].sum(axis=1) * w).groupby(days).transform('sum')
+        target = (daily_mwh / eff * f_share).fillna(0.0)
+        if target.max() > p_nom:
+            print(f"  [EV 고정충전] {l}: 필요 최대 충전 {target.max():,.0f} MW > 충전기 {p_nom:,.0f} MW → 충전기 용량으로 제한")
+        network.links_t.p_min_pu[l] = (fixed_share * target / p_nom).clip(upper=1.0)
+        network.links_t.p_max_pu[l] = (fixed_share * target * (1.0 + headroom) / p_nom).clip(upper=1.0)
+        done += 1
+    print(f"  [EV 고정충전] {done}개 충전 링크: 고정패턴 {fixed_share:.0%}, 일별 충전량 = 그날 EV 수요 ÷ 효율, "
+          f"하루 안 분포 = 패턴, 상한 여유 {headroom:.0%}"
+          + (f" / V1G {smart_share:.0%}는 별도 차량군으로 분리" if smart_share > 0 else ""))
+
+def _split_ev_v1g_fleet(network, opts):
+    """
+    V1G 차량군 분리(B38='Y', C38=s>0). 지역 EV 버스마다 s 몫을 별도 버스로 옮긴다.
+      V1G 버스  {R}_V1G_EV            : 주행수요 s×EV 수요(t), 배터리 s×EV_DSM, V2G 링크
+      V1G 충전기 {R}_EV_Charger_V1G   : p_nom = s×충전기, p_max_pu = A(t)
+        A(t) = A_max − (A_max − A_mean)·(x(t) − x_min)/(x_mean − x_min),  x = EV 주행수요(t)  [PyPSA-Eur]
+      V1G 배터리 {R}_EV_DSM_V1G       : 매일 출발 시각 e_min_pu = 출발 잔량, 그 외 기존 e_min_pu
+      기존 EV 버스(고정패턴 1−s)       : 수요·배터리·충전기 용량 × (1−s), 충전량은 고정패턴 그대로
+    """
+    s = float(opts.get('smart_share', 0.0))
+    if not opts.get('fixed') or s <= 0:
+        return
+    s = min(s, 1.0)
+    a_max, a_mean = float(opts['avail_max']), float(opts['avail_mean'])
+    dep_hour, dep_soc = int(opts['dep_hour']), float(opts['dep_soc'])
+    sns = network.snapshots
+    hours = pd.DatetimeIndex(sns).hour
+    w = network.snapshot_weightings['generators'].reindex(sns).fillna(1.0)
+    load = network.get_switchable_as_dense('Load', 'p_set')
+    L, S = network.links, network.stores
+    chargers = [l for l in L.index if 'ev' in l.lower() and 'charg' in l.lower()]
+    print(f"\n=== V1G 차량군 분리 (s={s:.0%}, 출발 {dep_hour}시 ≥ {dep_soc:.0%}, "
+          f"가용률 최대 {a_max:.0%}/평균 {a_mean:.0%}) ===")
+    for l in chargers:
+        bus = L.at[l, 'bus1']
+        loads = list(network.loads.index[network.loads.bus == bus])
+        stores = [x for x in S.index[S.bus == bus] if 'EV_DSM' in x]
+        p_nom = float(L.at[l, 'p_nom'] or 0.0)
+        if not loads or not stores or p_nom <= 0:
+            print(f"  [V1G] {l}: EV 수요·EV_DSM·충전기 용량 중 없는 항목 → 분리 생략")
+            continue
+        reg = bus.split('_')[0]
+        vbus = f"{reg}_V1G_EV" if bus == f"{reg}_EV" else f"{bus}_V1G"
+        b = network.buses.loc[bus]
+        network.add("Bus", vbus, carrier=b.carrier, x=b.x, y=b.y, v_nom=b.v_nom, unit=b.unit)
+
+        drive = load[loads].sum(axis=1)
+        x_min, x_mean = float(drive.min()), float((drive * w).sum() / w.sum())
+        if x_mean > x_min:
+            avail = (a_max - (a_max - a_mean) * (drive - x_min) / (x_mean - x_min)).clip(0.0, 1.0)
+        else:
+            avail = pd.Series(a_mean, index=sns)
+        for ld in loads:
+            p = load[ld]
+            network.add("Load", f"{ld}_V1G", bus=vbus, carrier=network.loads.at[ld, 'carrier'])
+            network.loads_t.p_set[f"{ld}_V1G"] = s * p
+            network.loads_t.p_set[ld] = (1.0 - s) * p
+
+        e_v = 0.0
+        for st in stores:
+            r = S.loc[st]
+            e_v += s * float(r.e_nom)
+            name = f"{st}_V1G"
+            network.add("Store", name, bus=vbus, carrier=r.carrier, e_nom=s * r.e_nom,
+                        e_nom_extendable=bool(r.e_nom_extendable), e_nom_min=s * r.e_nom_min,
+                        e_nom_max=s * r.e_nom_max, capital_cost=r.capital_cost, marginal_cost=r.marginal_cost,
+                        standing_loss=r.standing_loss, e_cyclic=bool(r.e_cyclic),
+                        e_min_pu=r.e_min_pu, e_max_pu=r.e_max_pu)
+            e_lo = pd.Series(float(r.e_min_pu), index=sns)
+            e_lo[hours == dep_hour] = min(max(dep_soc, float(r.e_min_pu)), float(r.e_max_pu))
+            network.stores_t.e_min_pu[name] = e_lo
+            for attr in ('e_nom', 'e_nom_min', 'e_nom_max'):
+                network.stores.at[st, attr] = (1.0 - s) * r[attr]
+
+        cr = L.loc[l]
+        vname = f"{l}_V1G"
+        network.add("Link", vname, bus0=cr.bus0, bus1=vbus, carrier=cr.carrier, p_nom=s * p_nom,
+                    p_nom_extendable=bool(cr.p_nom_extendable), p_nom_min=s * cr.p_nom_min,
+                    p_nom_max=s * cr.p_nom_max, efficiency=cr.efficiency, capital_cost=cr.capital_cost,
+                    marginal_cost=cr.marginal_cost)
+        network.links_t.p_max_pu[vname] = avail
+        for attr in ('p_nom', 'p_nom_min', 'p_nom_max'):
+            network.links.at[l, attr] = (1.0 - s) * cr[attr]
+        for tab in (network.links_t.p_min_pu, network.links_t.p_max_pu):
+            if l in tab.columns:
+                tab[l] = (tab[l] / (1.0 - s)).clip(upper=1.0) if s < 1.0 else 0.0
+
+        v2g = [x for x in L.index if 'v2g' in x.lower() and L.at[x, 'bus0'] == bus]
+        for x in v2g:
+            network.links.at[x, 'bus0'] = vbus
+
+        eff = float(cr.efficiency or 1.0)
+        need = (s * drive * w).groupby(pd.DatetimeIndex(sns).normalize()).sum() / eff
+        cap = (s * p_nom * avail * w).groupby(pd.DatetimeIndex(sns).normalize()).sum()
+        short = int((need > cap).sum())
+        print(f"  [V1G] {reg}: 충전기 {s * p_nom:,.0f} MW (가용률 {avail.min():.2f}~{avail.max():.2f}), "
+              f"배터리 {e_v:,.0f} MWh, 일 주행 {need.mean():,.0f} MWh, V2G {len(v2g)}개 이동"
+              + (f" / [경고] 일 충전가능량 < 필요량 {short}일" if short else ""))
+
+_COAL_PLANT_KEYWORDS = ['당진', '영흥', '하동', '삼척', '태안', '보령', '삼천포', '호남', '동해',
+                        '강릉안인', '북평', '신서천', '고성', '여수', '삼척그린파워']
+
+def _is_coal_generator(network, gen_name):
+    carrier = str(network.generators.at[gen_name, 'carrier']).lower() if gen_name in network.generators.index else ''
+    return 'coal' in carrier or any(kw in gen_name for kw in _COAL_PLANT_KEYWORDS)
+
+def _read_coal_cf_cap(interface_path):
+    """
+    interface.xlsx '입력시트' B41: 석탄발전 연간 이용률 상한(%).
+    빈칸이면 None(제약 없음). 셀 서식이 %이면 Excel 저장값(0.6 = 60%)을 그대로 비율로 사용.
+    반환: 0~1 비율 또는 None
+    """
+    try:
+        import openpyxl as _opxl_coal
+        if not os.path.exists(interface_path):
+            return None
+        wb = _opxl_coal.load_workbook(interface_path, read_only=True, data_only=True)
+        try:
+            if '입력시트' not in wb.sheetnames:
+                return None
+            cell = wb['입력시트']['B41']
+            raw = cell.value
+            if raw is None or str(raw).strip() == '':
+                print("[석탄 이용률 상한] 입력시트 B41 비어 있음 → 제약 없음")
+                return None
+            is_pct_fmt = '%' in str(cell.number_format or '')
+            text = str(raw).strip()
+            if text.endswith('%'):
+                pct = float(text.rstrip('%').strip())
+            elif is_pct_fmt and isinstance(raw, (int, float)):
+                pct = float(raw) * 100.0
+            else:
+                pct = float(text)
+        finally:
+            wb.close()
+        if not (0.0 <= pct <= 100.0):
+            print(f"[석탄 이용률 상한] B41 값 {raw!r} → {pct}% 범위(0~100) 밖 → 제약 없음")
+            return None
+        print(f"[석탄 이용률 상한] 입력시트 B41={raw!r} → 연간 이용률 ≤ {pct:.2f}%")
+        return pct / 100.0
+    except Exception as _e_coal_cf:
+        print(f"[석탄 이용률 상한] B41 읽기 실패: {_e_coal_cf} → 제약 없음")
+        return None
+
+# 지역별 재생에너지 기술적 잠재량 (GW, interface 'RE잠재량_REF' 시트)
+#   PV = KIER 신재생에너지자원지도 PV 기술적 잠재량
+#   WT = KIER 육상풍력 기술적 잠재량 + 해양공간계획 유보해역 기반 해상풍력 잠재량
+RE_TECH_POTENTIAL_GW = {
+    'PV': {'BSN': 38, 'CBD': 118, 'CND': 237, 'GBD': 283, 'GGD': 254, 'GND': 172,
+           'GWD': 131, 'ICN': 37, 'JBD': 185, 'JJD': 60, 'JND': 292},
+    'WT': {'BSN': 6 + 3.48, 'CBD': 25 + 0.0, 'CND': 37 + 5.95, 'GBD': 72 + 11.75, 'GGD': 44 + 0.40,
+           'GND': 33 + 4.93, 'GWD': 48 + 8.48, 'ICN': 4 + 13.33, 'JBD': 29 + 3.74, 'JJD': 9 + 15.10,
+           'JND': 45 + 56.33},
+}
+
+def _read_re_potential_cap(interface_path):
+    """
+    interface.xlsx '입력시트' 재생에너지 기술적 잠재량 상한 옵션
+      B42 = 'Y'        → 적용, 'N'/빈칸 → 미적용
+      B43 = 적용 비중(%). 60 / '60%' / % 서식 0.6 모두 60%. 빈칸이면 20%.
+    반환: 0~1 비율 또는 None(미적용)
+    """
+    try:
+        import openpyxl as _opxl_rep
+        if not os.path.exists(interface_path):
+            return None
+        wb = _opxl_rep.load_workbook(interface_path, read_only=True, data_only=True)
+        try:
+            if '입력시트' not in wb.sheetnames:
+                return None
+            ws = wb['입력시트']
+            b42 = ws['B42'].value
+            if b42 is None or str(b42).strip().upper() != 'Y':
+                print(f"[재생 잠재량 상한] 입력시트 B42={b42!r} → 미적용")
+                return None
+            cell = ws['B43']
+            raw = cell.value
+            if raw is None or str(raw).strip() == '':
+                print("[재생 잠재량 상한] B42=Y, B43 비어 있음 → 기본 20% 적용")
+                return 0.2
+            text = str(raw).strip()
+            if text.endswith('%'):
+                pct = float(text.rstrip('%').strip())
+            elif '%' in str(cell.number_format or '') and isinstance(raw, (int, float)):
+                pct = float(raw) * 100.0
+            else:
+                pct = float(text)
+        finally:
+            wb.close()
+        if not (0.0 < pct <= 100.0):
+            print(f"[재생 잠재량 상한] B43 값 {raw!r} → {pct}% 범위(0~100) 밖 → 미적용")
+            return None
+        print(f"[재생 잠재량 상한] 입력시트 B42='Y', B43={raw!r} → 기술적 잠재량 × {pct:.2f}%")
+        return pct / 100.0
+    except Exception as _e_rep:
+        print(f"[재생 잠재량 상한] B42/B43 읽기 실패: {_e_rep} → 미적용")
+        return None
+
+def _read_sector_power_targets(interface_path):
+    """
+    interface.xlsx '입력시트' 부문결합 연간 전력소비 목표 (TWh, 빈칸이면 미적용)
+      B48 = 히트펌프 전력소비,  B49 = 수전해(외부 수소 공급용) 전력소비
+    반환: {'hp_TWh': float|None, 'ely_TWh': float|None}
+    """
+    out = {'hp_TWh': None, 'ely_TWh': None}
+    try:
+        import openpyxl as _opxl_spt
+        if not os.path.exists(interface_path):
+            return out
+        wb = _opxl_spt.load_workbook(interface_path, read_only=True, data_only=True)
+        try:
+            if '입력시트' not in wb.sheetnames:
+                return out
+            ws = wb['입력시트']
+            for addr, key, label in (('B48', 'hp_TWh', '히트펌프'), ('B49', 'ely_TWh', '수전해')):
+                raw = ws[addr].value
+                if raw is None or str(raw).strip() == '':
+                    print(f"[부문결합 전력] {addr}({label}) 비어 있음 → 미적용")
+                    continue
+                try:
+                    v = float(str(raw).strip())
+                except ValueError:
+                    print(f"[부문결합 전력] {addr}({label})={raw!r} 해석 불가 → 미적용")
+                    continue
+                if v < 0:
+                    print(f"[부문결합 전력] {addr}({label})={v} 음수 → 미적용")
+                    continue
+                out[key] = v
+                print(f"[부문결합 전력] {addr}({label}) = {v:,.2f} TWh")
+        finally:
+            wb.close()
+    except Exception as _e_spt:
+        print(f"[부문결합 전력] B48/B49 읽기 실패: {_e_spt} → 미적용")
+    return out
+
+def _apply_sector_power_targets(network, targets):
+    """
+    히트펌프(B48)·수전해(B49) 연간 전력소비를 고정하고 같은 양을 Demand_EL에서 뺀다.
+      히트펌프: 지역 r 목표 E_r = B48 × (지역 열수요 / 전국 열수요)  → 제약 Σ_t p_HP,r = E_r
+                Demand_EL_r(t) −= E_r × 열수요_r(t) / Σ_t 열수요_r
+      수전해  : 제약 Σ_r Σ_t p_Electrolyser,r = B49 (전력 기준, 설비 배치·운전 시점은 최적화)
+                생산 수소는 연료전지 또는 지역 H2 버스의 외부 공급 {R}_H2_Offtake(sign=−1, 비용 0)로 사용
+                → 쓰임새도 최적화, 결과의 Hydrogen_Balance 시트에 생산량·연료전지 비중 집계
+                Demand_EL_r(t) ×= (1 − B49 / Σ Demand_EL)   (지역 Demand_EL 비중대로 차감)
+    분석 기간이 1년보다 짧으면 목표를 기간 비율로 줄인다. 제약은 _sector_power_target_constraint.
+    """
+    network.hp_energy_target = {}
+    network.ely_energy_target = None
+    hp_twh, ely_twh = targets.get('hp_TWh'), targets.get('ely_TWh')
+    if hp_twh is None and ely_twh is None:
+        return
+    sns = network.snapshots
+    w = network.snapshot_weightings['generators'].reindex(sns).fillna(1.0)
+    hours = float(w.sum())
+    scale = min(1.0, hours / 8760.0)
+    load = network.get_switchable_as_dense('Load', 'p_set')
+    loads, L = network.loads, network.links
+    el_loads = [x for x in loads.index if x.strip().endswith('_Demand_EL')]
+    print(f"\n=== 부문결합 전력소비 목표 (기간 {hours:,.0f}h, 목표 × {scale:.4f}) ===")
+
+    if hp_twh is not None:
+        hp = [l for l in L.index if l.strip().split('_', 1)[-1] == 'HP']
+        heat = {}
+        for l in hp:
+            names = [x for x in loads.index[loads.bus == L.at[l, 'bus1']] if 'Demand_H' in x and 'H2' not in x]
+            if names:
+                heat[l] = load[names].sum(axis=1)
+        tot = sum(float((h * w).sum()) for h in heat.values())
+        if tot <= 0:
+            print("  [히트펌프] 열수요 없음 → 미적용")
+        else:
+            target = hp_twh * 1e6 * scale
+            pmax = network.get_switchable_as_dense('Link', 'p_max_pu')
+            neg = 0
+            for l, h in heat.items():
+                h_mwh = float((h * w).sum())
+                e = target * h_mwh / tot
+                cap = float(L.at[l, 'p_nom']) * float((pmax[l] * w).sum())
+                if not bool(L.at[l, 'p_nom_extendable']) and e > cap:
+                    print(f"  [히트펌프] {l}: 목표 {e / 1e6:,.2f} TWh > 설비 최대 {cap / 1e6:,.2f} TWh → 최대로 제한")
+                    e = cap * 0.999
+                network.hp_energy_target[l] = e
+                el = f"{l.split('_')[0]}_Demand_EL"
+                el = next((x for x in el_loads if x.strip() == el), None)
+                if el is None:
+                    print(f"  [히트펌프] {l}: Demand_EL 없음 → 차감 생략")
+                    continue
+                new = load[el] - e * h / h_mwh
+                neg += int((new < 0).sum())
+                network.loads_t.p_set[el] = new.clip(lower=0.0)
+                load[el] = network.loads_t.p_set[el]
+            print(f"  [히트펌프] {len(network.hp_energy_target)}개 지역: 전력소비 합 "
+                  f"{sum(network.hp_energy_target.values()) / 1e6:,.2f} TWh (열수요 비중 배분), "
+                  f"Demand_EL에서 열수요 시간패턴으로 차감" + (f" / [경고] 음수 {neg}시간 0으로 보정" if neg else ""))
+
+    if ely_twh is not None:
+        ely = [l for l in L.index if l.strip().split('_', 1)[-1] == 'Electrolyser']
+        h2_buses = sorted(set(L.loc[ely, 'bus1']))
+        if not h2_buses:
+            print("  [수전해] 수전해 링크 없음 → 미적용")
+            return
+        e = ely_twh * 1e6 * scale
+        el_tot = float((load[el_loads].mul(w, axis=0)).sum().sum())
+        f = 1.0 - e / el_tot
+        if f <= 0:
+            print(f"  [수전해] 목표 {e / 1e6:,.2f} TWh ≥ Demand_EL 합 {el_tot / 1e6:,.2f} TWh → 미적용")
+            return
+        for el in el_loads:
+            network.loads_t.p_set[el] = load[el] * f
+        for b in h2_buses:
+            name = f"{b.split('_')[0]}_H2_Offtake"
+            network.add("Generator", name, bus=b, carrier=network.buses.at[b, 'carrier'], sign=-1.0,
+                        p_nom=1e6, p_nom_extendable=False, marginal_cost=0.0, capital_cost=0.0)
+        network.ely_energy_target = e
+        print(f"  [수전해] 전국 수전해 전력소비 {e / 1e6:,.2f} TWh 고정 ({len(ely)}개 지역 설비 배치·운전은 최적화), "
+              f"생산 수소는 연료전지/외부 공급 중 최적 사용 / Demand_EL × {f:.4f} (지역 비중대로 차감)")
+
+def _apply_re_potential_cap(network, share):
+    """
+    지역별 PV·WT p_nom_max = max(잠재량 × share, 기존 p_nom + 1 MW, p_nom_min + 1 MW). 기존 상한이 더 작으면 유지.
+    상한이 기존 설비와 정확히 같으면(p_nom_min = p_nom_max) CPLEX Barrier가 수렴하지 못하는 경우가 있어 1 MW 여유를 둔다.
+    """
+    g = network.generators
+    rows = []
+    for tech, pots in RE_TECH_POTENTIAL_GW.items():
+        for r, pot_gw in pots.items():
+            name = f'{r}_{tech}'
+            if name not in g.index:
+                continue
+            p_nom = float(pd.to_numeric(g.at[name, 'p_nom'], errors='coerce') or 0.0)
+            p_min = float(pd.to_numeric(g.at[name, 'p_nom_min'], errors='coerce') or 0.0)
+            cap = max(share * pot_gw * 1e3, p_nom + 1.0, p_min + 1.0)
+            cur = pd.to_numeric(g.at[name, 'p_nom_max'], errors='coerce')
+            new = cap if pd.isna(cur) else min(float(cur), cap)
+            g.at[name, 'p_nom_max'] = new
+            rows.append((tech, r, pot_gw, p_nom / 1e3, new / 1e3))
+    if not rows:
+        print("[재생 잠재량 상한] 대상 발전기(XX_PV / XX_WT) 없음")
+        return
+    df = pd.DataFrame(rows, columns=['tech', 'region', '잠재량_GW', '기존_GW', '상한_GW'])
+    for tech in ('PV', 'WT'):
+        sub = df[df.tech == tech]
+        if sub.empty:
+            continue
+        detail = ', '.join(f"{row.region} {row.상한_GW:.1f}" for row in sub.itertuples())
+        print(f"  {tech} 상한 합계 {sub.상한_GW.sum():.1f} GW (잠재량 {sub.잠재량_GW.sum():.0f} GW): {detail}")
+
 def _read_line_flex_settings(interface_path):
     """
     interface.xlsx '인터페이스_1' 시트 행 6~51에서
@@ -888,10 +1374,15 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
             return None
         df = input_data['load_patterns'].copy()
 
-        # 1) 고정 위치(B8:F8765)에서 직접 읽기 시도 [EV/DC/Fab 패턴 포함]
+        # 1) 고정 열 위치에서 직접 읽기 시도 [EV/DC/Fab 패턴 포함]
+        #    데이터 시작 = A열 '시간' 헤더 바로 아래 행(0시). 헤더가 없으면 iloc 7
         try:
             base_len = 8760
-            start_row = 7  # Excel 8행 → iloc 7
+            start_row = 7
+            _col_a = df.iloc[:20, 0].astype(str).str.strip().str.lower()
+            _hdr_pos = np.flatnonzero(_col_a.isin(['시간', 'hour', 'time']).values)
+            if len(_hdr_pos):
+                start_row = int(_hdr_pos[0]) + 1
             # 열 인덱스(0-based): A=시간(0), B=전력(1), C=열(2), D=수소(3),
             #   E=EV_DRIVING(4), F=EV_CHARGING(5), G=빈칸(6),
             #   H=DC_patterns(7), I=Fab_patterns(8), J=빈칸(9),
@@ -949,7 +1440,7 @@ def _get_load_pattern(input_data, region, demand_type, snapshots_len):
                         else:
                             label = _base_label
                         sample_n = min(8, len(pattern_base))
-                        print(f"load_patterns 고정위치 사용: {label}, 시작행 Excel 8행 기준")
+                        print(f"load_patterns 고정위치 사용: {label}, 시작행 Excel {start_row + 2}행")
                         print(f"패턴 길이(기본): {len(pattern_base)} (최대 {np.nanmax(pattern_base):.6f}, 평균 {np.nanmean(pattern_base):.6f})")
                         print(f"패턴 샘플 앞 {sample_n}개: {np.round(pattern_base[:sample_n], 6).tolist()}")
                         if len(pattern_base) >= 24:
@@ -2248,9 +2739,15 @@ def create_network(input_data):
             # V2G 링크에 역순 EV_Charging 패턴 적용
             # EV_Charging이 낮을 때(사람들이 충전 안 할 때) → V2G 최대 가동
             # EV_Charging이 높을 때(사람들이 충전할 때) → V2G 가동 불가
+            _ev_opts = _read_ev_charging_options(
+                os.path.abspath(os.path.join(get_base_dir(), 'interface.xlsx')))
             print("\n=== V2G 패턴 적용 시작 (역순 EV_Charging) ===")
             try:
-                ev_charging_pattern = _get_load_pattern(input_data, None, 'EV_CHARGING', len(snapshots))
+                if _ev_opts['pattern'] is not None:
+                    ev_charging_pattern = adjust_pattern_length(_ev_opts['pattern'], len(snapshots))
+                    print("  EV 충전 패턴: interface.xlsx load_patterns F6:F8765")
+                else:
+                    ev_charging_pattern = _get_load_pattern(input_data, None, 'EV_CHARGING', len(snapshots))
                 if ev_charging_pattern is not None:
                     # 역순 변환: v2g_pattern = 1 - ev_charging_pattern
                     # EV 충전이 낮을수록 V2G 가동률 높음
@@ -2276,6 +2773,34 @@ def create_network(input_data):
                     print("  [경고] EV_CHARGING 패턴을 찾지 못해 V2G 패턴 미적용 (기본값 1.0 유지)")
             except Exception as _e_v2g:
                 print(f"  V2G 패턴 적용 오류: {_e_v2g}")
+
+            # EV 충전 옵션 (interface.xlsx 입력시트 B38: 고정 충전패턴, B39: V2G)
+            print("\n=== EV 충전 옵션 적용 ===")
+            network.ev_charging_options = {k: v for k, v in _ev_opts.items() if k != 'pattern'}
+            _v2g_links = [l for l in network.links.index if 'v2g' in l.lower()]
+            if not _ev_opts['v2g'] and _v2g_links:
+                for _l in _v2g_links:
+                    network.links_t.p_max_pu[_l] = pd.Series(0.0, index=network.snapshots)
+                print(f"  V2G 끔: {len(_v2g_links)}개 링크 p_max_pu=0")
+            elif _v2g_links:
+                print(f"  V2G 유지: {len(_v2g_links)}개 링크 (기존 방식)")
+            if _ev_opts['fixed']:
+                _pat = adjust_pattern_length(_ev_opts['pattern'], len(network.snapshots))
+                print(f"  고정 충전패턴 사용: load_patterns F6:F8765 "
+                      f"(최소 {_pat.min():.4f} / 최대 {_pat.max():.4f} / 합 {_pat.sum():.1f})")
+                _apply_ev_fixed_charging_bounds(network, _pat, _ev_opts.get('smart_share', 0.0))
+            else:
+                print("  충전 방식: 기존(충전 시점 최적화)")
+
+        # 석탄발전 연간 이용률 상한 (interface.xlsx 입력시트 B41, %)
+        network.coal_cf_cap = _read_coal_cf_cap(
+            os.path.abspath(os.path.join(get_base_dir(), 'interface.xlsx')))
+
+        # 재생에너지 지역별 기술적 잠재량 상한 (interface.xlsx 입력시트 B42=Y, B43=비중 %)
+        _re_pot_share = _read_re_potential_cap(
+            os.path.abspath(os.path.join(get_base_dir(), 'interface.xlsx')))
+        if _re_pot_share is not None:
+            _apply_re_potential_cap(network, _re_pot_share)
 
         # 저장장치 추가
         if 'stores' in input_data:
@@ -2662,6 +3187,10 @@ def create_network(input_data):
         else:
             print("경고: constraints 시트가 없거나 비어있습니다.")
         
+        _split_ev_v1g_fleet(network, getattr(network, 'ev_charging_options', {}))
+        _apply_sector_power_targets(network, _read_sector_power_targets(
+            os.path.abspath(os.path.join(get_base_dir(), 'interface.xlsx'))))
+
         # 최종 안전장치: EV 버스 슬랙 활성화 (1e6 원/MWh), EL 버스는 비활성화
         # - EV 버스: 1e6 원/MWh (EV 수요가 EV 버스에 있으므로 필수)
         # - EL 버스: 자체 발전기(PV, WT, Nuclear 등)가 있으므로 슬랙 불필요
@@ -2747,6 +3276,13 @@ def create_network(input_data):
         print(f"네트워크 생성 중 오류 발생: {str(e)}")
         traceback.print_exc()
         return None
+
+def _is_optimal_status(status):
+    """linopy 상태가 ('ok', 'optimal')일 때만 성공으로 판정"""
+    if isinstance(status, tuple):
+        return (len(status) >= 2 and str(status[0]).strip().lower() == 'ok'
+                and str(status[1]).strip().lower() == 'optimal')
+    return str(status).strip().lower() in ('ok', 'optimal')
 
 def optimize_network(network):
     """네트워크 최적화"""
@@ -2923,6 +3459,83 @@ def optimize_network(network):
                           f"= {annual_limit_mwh:.0f} MWh/년")
             except Exception as _e_dr_c:
                 print(f"DR 연간제약 추가 경고: {_e_dr_c}")
+
+        def _coal_cf_cap_constraint(n, sns):
+            """석탄 연간 발전량 ≤ 이용률 상한 × Σ설비용량 × 분석시간 (입력시트 B41, 총량 제약)"""
+            cap = getattr(n, 'coal_cf_cap', None)
+            if cap is None:
+                return
+            try:
+                import xarray as _xr
+                m = n.model
+                gen_coords = set(m.variables['Generator-p'].coords['Generator'].values)
+                coal = [g for g in n.generators.index if g in gen_coords and _is_coal_generator(n, g)]
+                if not coal:
+                    print("  [석탄 이용률 상한] 석탄 발전기 없음 — 제약 미추가")
+                    return
+                w = n.snapshot_weightings['generators'].loc[sns]
+                hours = float(w.sum())
+                w_da = _xr.DataArray(w.values.astype(float), coords={'snapshot': sns}, dims=['snapshot'])
+                energy = (m.variables['Generator-p'].sel(Generator=coal, snapshot=sns) * w_da).sum()
+                ext = [g for g in coal if bool(n.generators.at[g, 'p_nom_extendable'])]
+                fixed = [g for g in coal if g not in ext]
+                fixed_cap = float(n.generators.loc[fixed, 'p_nom'].sum())
+                lhs = energy
+                if ext and 'Generator-p_nom' in m.variables:
+                    lhs = energy - cap * hours * m.variables['Generator-p_nom'].sel(Generator=ext).sum()
+                m.add_constraints(lhs <= cap * hours * fixed_cap, name='Coal-CF-cap')
+                print(f"  [석탄 이용률 상한] 석탄 {len(coal)}기(고정 {fixed_cap:,.0f} MW"
+                      + (f", 확장 {len(ext)}기" if ext else "") + f"), {hours:,.0f}h: "
+                      f"연간 발전량 ≤ {cap * 100:.2f}% → ≤ {cap * hours * fixed_cap / 1e6:,.2f} TWh"
+                      + (" + 확장분" if ext else ""))
+            except Exception as _e_ccf:
+                print(f"석탄 이용률 상한 제약 추가 경고: {_e_ccf}")
+
+        def _ess_pcs_constraint(n, sns):
+            """ESS 충전·방전 링크는 PCS 한 대: p_nom(ESS_Ch) = p_nom(ESS_Disch). 둘 다 고정이면 제약 없음"""
+            m = n.model
+            if 'Link-p_nom' not in m.variables:
+                return
+            P = m.variables['Link-p_nom']
+            dim = P.dims[0]
+            ext = set(P.coords[dim].values)
+            sel = lambda name: P.sel({dim: name})
+            added = 0
+            for ch in [l for l in n.links.index if l.endswith('_ESS_Ch')]:
+                dis = ch[:-len('_Ch')] + '_Disch'
+                if dis not in n.links.index or (ch not in ext and dis not in ext):
+                    continue
+                if ch in ext and dis in ext:
+                    lhs, rhs = sel(ch) - sel(dis), 0.0
+                elif ch in ext:
+                    lhs, rhs = sel(ch), float(n.links.at[dis, 'p_nom'])
+                else:
+                    lhs, rhs = sel(dis), float(n.links.at[ch, 'p_nom'])
+                m.add_constraints(lhs == rhs, name=f'ESS-PCS-{ch}')
+                added += 1
+            if added:
+                print(f"  [ESS PCS] {added}개 지역: 충전 링크 용량 = 방전 링크 용량")
+
+        def _sector_power_target_constraint(n, sns):
+            """히트펌프 지역별 연간 전력소비 = 목표, 수전해 전국 연간 전력소비 = 목표 (입력시트 B48·B49)"""
+            import xarray as _xr
+            m = n.model
+            w = n.snapshot_weightings['generators'].loc[sns]
+            w_da = _xr.DataArray(w.values.astype(float), coords={'snapshot': sns}, dims=['snapshot'])
+            hp = {l: e for l, e in getattr(n, 'hp_energy_target', {}).items()
+                  if l in m.variables['Link-p'].coords['Link'].values}
+            if hp:
+                names = list(hp)
+                lhs = (m.variables['Link-p'].sel(Link=names, snapshot=sns) * w_da).sum('snapshot')
+                rhs = _xr.DataArray([hp[l] for l in names], coords={'Link': names}, dims=['Link'])
+                m.add_constraints(lhs == rhs, name='HP-annual-energy')
+                print(f"  [히트펌프 전력] {len(names)}개 지역 연간 전력소비 고정: 합 {sum(hp.values()) / 1e6:,.2f} TWh")
+            target = getattr(n, 'ely_energy_target', None)
+            if target:
+                ely = [l for l in n.links.index if l.strip().split('_', 1)[-1] == 'Electrolyser']
+                lhs = (m.variables['Link-p'].sel(Link=ely, snapshot=sns) * w_da).sum()
+                m.add_constraints(lhs == target, name='Electrolyser-annual-energy')
+                print(f"  [수전해 전력] {len(ely)}개 지역 합 {target / 1e6:,.2f} TWh 고정 (배치·운전 최적화)")
 
         # =====================================================================
         # 선로 유연 운영 설정 — 인터페이스_1 F/G/H열 기반
@@ -3481,11 +4094,15 @@ def optimize_network(network):
                         print(f"  [경고] CHP CO2 통합제약 추가 실패: {e_co2}")
 
                 def _combined_extra_functionality(n, sns):
-                    """DR 연간 한도 + 선로 유연 운영 + CHP CO2 통합 + DC/Fab RE 시간별 조달"""
+                    """DR 연간 한도 + 선로 유연 운영 + CHP CO2 통합 + DC/Fab RE 시간별 조달 + ESS PCS 용량 연동
+                    + 히트펌프·외부 수소 연간 전력소비 목표"""
                     _dr_annual_hours_constraint(n, sns)
                     _line_flex_constraint(n, sns)
                     _chp_co2_constraint(n, sns)
                     _dc_fab_re_cfe_constraint(n, sns)
+                    _coal_cf_cap_constraint(n, sns)
+                    _ess_pcs_constraint(n, sns)
+                    _sector_power_target_constraint(n, sns)
 
                 status = network.optimize(
                     solver_name=active_solver,
@@ -3498,59 +4115,11 @@ def optimize_network(network):
                     st_main = status[0]
                 else:
                     st_main = str(status)
-                if st_main and ('ok' in st_main.lower() or 'optimal' in st_main.lower()
-                               or 'feasible' in st_main.lower()):
+                if _is_optimal_status(status):
                     break
-                # ── 해가 존재하는 경우 수락 (unknown / feasible / time_limit 등) ──
-                # solutiontype=2 (Barrier primal-only) 또는 Crossover 수치 노이즈 시
-                # linopy가 "unknown"으로 반환하더라도 유효한 목적함수가 있으면 수락
-                _accept_statuses = ('unknown', 'feasible', 'aborted', 'time')
-                if st_main and any(s in st_main.lower() for s in _accept_statuses):
-                    try:
-                        # 목적함수 값으로만 해 유효성 확인
-                        # (network.model은 optimize() 반환 후 접근 불가한 경우가 있어 sol 체크 제거)
-                        obj_val = getattr(network, 'objective', None)
-                        m = getattr(network, 'model', None)
-                        obj_linopy = None
-                        if m is not None:
-                            try:
-                                obj_linopy = float(m.objective.value)
-                            except Exception:
-                                pass
-                        valid_obj = obj_linopy if obj_linopy is not None else obj_val
-                        if valid_obj is not None and float(valid_obj) > 0:
-                            print(f"  ▶ 상태='{st_main}' 이지만 유효한 Barrier 해 감지 → 수락")
-                            print(f"    목적함수={float(valid_obj):.4e}")
-                            # linopy 모델 상태를 강제 ok로 패치 후 assign_solution 호출
-                            try:
-                                _m = getattr(network, 'model', None)
-                                if _m is not None:
-                                    if hasattr(_m, 'status'):
-                                        _m.status = 'ok'
-                                    if hasattr(_m, 'termination_condition'):
-                                        _m.termination_condition = 'optimal'
-                            except Exception:
-                                pass
-                            # PyPSA assign_solution 수동 호출 시도
-                            try:
-                                from pypsa.optimization.optimize import assign_solution
-                                assign_solution(network)
-                                print(f"    assign_solution 완료 → 결과 정상 반영")
-                            except Exception as _e_as:
-                                try:
-                                    from pypsa.optimization import assign_solution
-                                    assign_solution(network)
-                                    print(f"    assign_solution 완료 → 결과 정상 반영")
-                                except Exception:
-                                    print(f"    assign_solution 실패({_e_as}), 결과 일부 누락 가능")
-                            if getattr(network, 'objective', None) is None:
-                                network.objective = float(valid_obj)
-                            last_status = ('ok', 'optimal')
-                            break
-                        else:
-                            print(f"  ▶ 상태='{st_main}', 유효한 해 없음 (obj={valid_obj})")
-                    except Exception as _e_fb:
-                        print(f"  해 수락 fallback 오류: {_e_fb}")
+                print(f"  ▶ 최적해 아님(상태={status}) → 실패로 처리 (수렴하지 않은 해는 사용하지 않음)")
+                if active_solver == 'cplex':
+                    print("    참고: 수치 수렴 문제라면 환경변수 PYPSA_CPLEX_CONVERGETOL(예: 1e-5)로 허용오차 완화 가능")
             except ValueError as e:
                 if 'No objects to concatenate' in str(e):
                     print("경고: AC 각도 결과(v_ang)가 없어 후처리에서 concat 실패. 각도 결과 없이 계속 진행합니다.")
@@ -3588,12 +4157,7 @@ def optimize_network(network):
         except Exception:
             pass
         
-        # 최종 성공 여부: 'ok' 또는 'optimal' 포함 시 성공
-        _final_ok = (
-            bool(last_status) and
-            (('ok' in str(last_status).lower()) or ('optimal' in str(last_status).lower()))
-        )
-        return _final_ok
+        return _is_optimal_status(last_status)
         
     except Exception as e:
         print(f"\n최적화 중 오류 발생: {str(e)}")
@@ -3707,6 +4271,8 @@ def _classify_technology(gen_or_link_name):
         return '히트펌프'
     if 'electrolyser' in name or 'electrolyzer' in name or 'electrolysis' in name:
         return '전해조'
+    if 'h2_offtake' in name:
+        return '외부수소공급'
     if 'h2' in name or 'hydrogen' in name:
         return '수소'
     if 'heat' in name:
@@ -3745,6 +4311,13 @@ def build_final_energy_supply_tables(network):
     emission_factors = {}
     for carrier in network.carriers.index:
         emission_factors[carrier] = network.carriers.loc[carrier, 'co2_emissions']
+
+    def _cap(df, name, eff=1.0):
+        """설비용량(MW, 출력 포트 기준): 최적화 용량(p_nom_opt) 우선, 없으면 p_nom × 해당 포트 효율"""
+        v = df.at[name, 'p_nom_opt'] if 'p_nom_opt' in df.columns else _np.nan
+        if _pd.isna(v):
+            v = df.at[name, 'p_nom']
+        return float(v) * abs(float(eff)) if _pd.notna(v) else 0.0
     
     if not network.generators.empty and not network.generators_t.p.empty:
         for gen in network.generators.index:
@@ -3761,7 +4334,10 @@ def build_final_energy_supply_tables(network):
             tech = _classify_technology(gen)
             series = network.generators_t.p[gen] if gen in network.generators_t.p.columns else _pd.Series(0.0, index=network.snapshots)
             val = float(_np.nansum(series.values))
-            if val <= 0:
+            # Failsafe·외부 수소 출구(H2_Offtake)는 가상 설비 → 용량 0, 실제 흐름이 있을 때만 기록
+            virtual = 'failsafe' in gen_lower or 'offtake' in gen_lower
+            cap = 0.0 if virtual else _cap(network.generators, gen)
+            if val <= 0 and (virtual or cap <= 0):
                 continue
             
             # 배출량 계산 (전력량 기준)
@@ -3775,9 +4351,9 @@ def build_final_energy_supply_tables(network):
             emission_factor_per_mwh = emission_factor / gen_efficiency if gen_efficiency > 0 else emission_factor
             emissions = val * emission_factor_per_mwh
             
-            rows_total.append([final_energy, tech, val, emissions])
+            rows_total.append([final_energy, tech, val, emissions, cap])
             region = gen.split('_')[0] if '_' in gen else ''
-            rows_region.append([region, final_energy, tech, val, emissions])
+            rows_region.append([region, final_energy, tech, val, emissions, cap])
     def _add_link_port_supply(port_idx):
         p_attr = f"p{port_idx}"
         if not hasattr(network.links_t, p_attr):
@@ -3840,19 +4416,68 @@ def build_final_energy_supply_tables(network):
                 except:
                     emissions = 0.0
             
-            rows_total.append([final_energy, tech, val, emissions])
+            eff_col = 'efficiency' if port_idx == 1 else f'efficiency{port_idx}'
+            eff = network.links.at[link, eff_col] if eff_col in network.links.columns else 1.0
+            # 히트펌프·전해조는 전력 소비(입력) 기준 용량, 그 외는 출력 포트 기준
+            if tech in ('히트펌프', '전해조') or link.strip().split('_', 1)[-1] in ('HP', 'Electrolyser'):
+                eff = 1.0
+            cap = _cap(network.links, link, eff if _pd.notna(eff) else 1.0)
+            rows_total.append([final_energy, tech, val, emissions, cap])
             region = str(dest_bus).split('_')[0] if '_' in str(dest_bus) else ''
-            rows_region.append([region, final_energy, tech, val, emissions])
+            rows_region.append([region, final_energy, tech, val, emissions, cap])
     for k in [1, 2, 3]:
         _add_link_port_supply(k)
-    total_df = _pd.DataFrame(rows_total, columns=['final_energy', 'technology', 'supply_MWh', 'emissions_tCO2'])
+    cols = ['supply_MWh', 'emissions_tCO2', 'capacity_MW']
+    total_df = _pd.DataFrame(rows_total, columns=['final_energy', 'technology'] + cols)
     if not total_df.empty:
-        total_df = total_df.groupby(['final_energy', 'technology'], as_index=False)[['supply_MWh', 'emissions_tCO2']].sum()
-    by_region_df = _pd.DataFrame(rows_region, columns=['region', 'final_energy', 'technology', 'supply_MWh', 'emissions_tCO2'])
+        total_df = total_df.groupby(['final_energy', 'technology'], as_index=False)[cols].sum()
+    by_region_df = _pd.DataFrame(rows_region, columns=['region', 'final_energy', 'technology'] + cols)
     if not by_region_df.empty:
-        by_region_df = by_region_df.groupby(['region', 'final_energy', 'technology'], as_index=False)[['supply_MWh', 'emissions_tCO2']].sum()
+        by_region_df = by_region_df.groupby(['region', 'final_energy', 'technology'], as_index=False)[cols].sum()
     return total_df, by_region_df
 
+
+def build_hydrogen_balance_table(network):
+    """
+    지역별·전국 수소 수지 (TWh, 분석 기간 가중합)
+      수소 생산 = 수전해 출력, 연료전지 사용 = 연료전지 수소 투입, 외부 공급 = {R}_H2_Offtake
+      지역간 순이동·저장 변화 = 생산 − 연료전지 − 외부 공급 (잔차)
+      연료전지 비중 = 연료전지 사용 / 수소 생산
+    """
+    L = network.links
+    ely = [l for l in L.index if l.strip().split('_', 1)[-1] == 'Electrolyser']
+    if not ely or network.links_t.p0.empty:
+        return None
+    w = network.snapshot_weightings['generators']
+    def tot(df, col):
+        return float(df[col].mul(w, axis=0).sum()) / 1e6 if col in df.columns else 0.0
+    fc = [l for l in L.index if l.strip().split('_', 1)[-1] == 'Fuelcell']
+    off = [g for g in network.generators.index if g.endswith('_H2_Offtake')]
+    rows = []
+    for r in sorted({l.split('_')[0] for l in ely + fc}):
+        e = f'{r}_Electrolyser'
+        f = f'{r}_Fuelcell'
+        o = f'{r}_H2_Offtake'
+        row = {
+            '지역': r,
+            '수전해 전력소비 (TWh)': tot(network.links_t.p0, e),
+            '수전해 설비 (GW)': float(L.at[e, 'p_nom_opt']) / 1e3 if e in L.index else 0.0,
+            '수소 생산 (TWh_H2)': -tot(network.links_t.p1, e),
+            '연료전지 사용 (TWh_H2)': tot(network.links_t.p0, f),
+            '외부 공급 (TWh_H2)': tot(network.generators_t.p, o),
+        }
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    nat = df.drop(columns='지역').sum()
+    nat['지역'] = '전국'
+    df = pd.concat([df, nat.to_frame().T], ignore_index=True)
+    num = [c for c in df.columns if c != '지역']
+    df[num] = df[num].astype(float)
+    df['지역간 순이동·저장 변화 (TWh_H2)'] = df['수소 생산 (TWh_H2)'] - df['연료전지 사용 (TWh_H2)'] - df['외부 공급 (TWh_H2)']
+    prod = df['수소 생산 (TWh_H2)']
+    df['연료전지 비중 (%)'] = np.where(prod > 1e-9, df['연료전지 사용 (TWh_H2)'] / prod.where(prod > 1e-9) * 100, np.nan)
+    df['외부 공급 비중 (%)'] = np.where(prod > 1e-9, df['외부 공급 (TWh_H2)'] / prod.where(prod > 1e-9) * 100, np.nan)
+    return df
 
 def build_regional_power_balance_table(network):
     """지역별 전력수급 균형 테이블 생성
@@ -4713,6 +5338,16 @@ def save_results(network, filename=None, subdir=None):
                     fe_by_region.to_excel(writer, sheet_name='FinalEnergy_Supply_ByRegion', index=False)
             except Exception as _e_fe:
                 print(f"최종에너지 공급 집계 시트 저장 경고: {_e_fe}")
+
+            try:
+                h2_df = build_hydrogen_balance_table(network)
+                if h2_df is not None and not h2_df.empty:
+                    h2_df.to_excel(writer, sheet_name='Hydrogen_Balance', index=False)
+                    _nat = h2_df.iloc[-1]
+                    print(f"Hydrogen_Balance 시트 저장: 수소 생산 {_nat['수소 생산 (TWh_H2)']:,.2f} TWh_H2, "
+                          f"연료전지 비중 {_nat['연료전지 비중 (%)']:.1f}%")
+            except Exception as _e_h2:
+                print(f"Hydrogen_Balance 시트 저장 경고: {_e_h2}")
 
             # 지역별 전력수급 균형 시트 추가
             try:

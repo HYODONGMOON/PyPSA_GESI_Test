@@ -35,8 +35,8 @@ def analyze(n, case):
     lk = L.index.map(kind)
     out = {'case': case}
 
-    def lsum(s, k):
-        return float(s[L.index[lk == k]].sum())
+    def lsum(s, *ks):
+        return float(s[L.index[lk.isin(ks)]].sum())
 
     # 설비
     for car, key in (('solar', 'PV'), ('wind', 'WT')):
@@ -56,6 +56,8 @@ def analyze(n, case):
     out['ESS_GWh'] = S.loc[ess, 'e_nom_opt'].sum() / 1e3
     out['ESS_GW'] = L.loc[L.index[lk == 'ESS_Ch'], 'p_nom_opt'].sum() / 1e3
     out['ESS_new_GWh'] = (S.loc[ess, 'e_nom_opt'] - S.loc[ess, 'e_nom']).sum() / 1e3
+    ess_re = S.index[S.index.map(kind) == 'ESS_RE']
+    out['ESS_RE_GWh'] = S.loc[ess_re, 'e_nom_opt'].sum() / 1e3
     for k, key in (('Electrolyser', 'electrolyser_GW'), ('Fuelcell', 'fuelcell_GW')):
         out[key] = L.loc[L.index[lk == k], 'p_nom_opt'].sum() / 1e3
     out['H2_storage_GWh'] = S.loc[S.index[S.index.map(kind) == 'H2_Storage'], 'e_nom_opt'].sum() / 1e3
@@ -76,7 +78,8 @@ def analyze(n, case):
     out['HP_heat_TWh'] = -lsum(p1, 'HP')
     out['electrolyser_elec_TWh'] = lsum(p0, 'Electrolyser')
     out['fuelcell_power_TWh'] = -lsum(p1, 'Fuelcell')
-    out['EV_charge_TWh'] = lsum(p0, 'EV_Charger')
+    out['EV_charge_TWh'] = lsum(p0, 'EV_Charger', 'EV_Charger_V1G')
+    out['V1G_charge_TWh'] = lsum(p0, 'EV_Charger_V1G')
     out['V2G_TWh'] = -lsum(p1, 'EV_V2G')
     out['ESS_charge_TWh'] = lsum(p0, 'ESS_Ch')
     out['ESS_loss_TWh'] = lsum(p0, 'ESS_Ch') + lsum(p1, 'ESS_Disch')
@@ -87,7 +90,7 @@ def analyze(n, case):
     load = n.loads_t.p.mul(w, axis=0).sum() / 1e6
     lkind = n.loads.index.map(kind)
     for k in ('Demand_EL', 'Demand_DC', 'Demand_Fab', 'Demand_H', 'Demand_EV', 'Demand_H2'):
-        out[f'{k}_TWh'] = float(load[n.loads.index[lkind == k]].sum())
+        out[f'{k}_TWh'] = float(load[n.loads.index[lkind.isin([k, f'{k}_V1G'])]].sum())
     out['heat_storage_loss_TWh'] = lsum(p0, 'Heat_Ch') + lsum(p1, 'Heat_Disch')
     out['elec_demand_total_TWh'] = (out['Demand_EL_TWh'] + out['Demand_DC_TWh'] + out['Demand_Fab_TWh']
                                     + out['HP_elec_TWh'] + out['electrolyser_elec_TWh'] + out['EV_charge_TWh'])

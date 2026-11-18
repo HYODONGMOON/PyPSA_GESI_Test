@@ -80,7 +80,7 @@ CAT_COAL       = ["_석탄", "_무연탄", "_유연탄", "_태안", "_보령", "
                   "_삼천포", "_영흥", "_한울", "_호남", "_여수", "_울산", "_광양",
                   "_Coal", "_coal"]
 CAT_DR         = ["_DR"]
-CAT_SKIP       = ["_slack", "_Fallback", "_Fuel_Supply", "_Slack_Failsafe"]
+CAT_SKIP       = ["_slack", "_Fallback", "_Fuel_Supply", "_Slack_Failsafe", "_H2_Offtake"]
 
 # Link 분류
 LINK_ELECTROLYSER = ["Electrolyser"]
